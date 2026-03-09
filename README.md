@@ -132,7 +132,7 @@ sudo systemctl restart lldpd
 
 ```bash
 sudo rm -rf /opt/raspberryfluke
-sudo git clone https://github.com/MKWB/raspberryfluke.git /opt/raspberryfluke
+sudo git clone https://github.com/MKWB/RaspberryFluke.git /opt/raspberryfluke
 sudo chown -R root:root /opt/raspberryfluke
 ```
 
