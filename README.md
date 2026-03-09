@@ -132,43 +132,11 @@ sudo cp -r ~/e-Paper/RaspberryPi_JetsonNano/python/lib/waveshare_epd /opt/raspbe
 
 sudo chmod 755 /opt/raspberryfluke/raspberryfluke.py
 
-12. Create the systemd service file:
+12. Install the System Service File
 
-sudo nano /etc/systemd/system/raspberryfluke.service
+sudo cp /opt/raspberryfluke/raspberryfluke.service /etc/systemd/system/
 
-Paste the following:
-
-[Unit]
-Description=RaspberryFluke LLDP/CDP E-Paper Display
-After=network.target lldpd.service
-Wants=lldpd.service
-
-[Service]
-Type=simple
-User=root
-Group=root
-WorkingDirectory=/opt/raspberryfluke
-Environment=PYTHONPATH=/opt/raspberryfluke
-ExecStart=/usr/bin/python3 /opt/raspberryfluke/raspberryfluke.py
-Restart=on-failure
-RestartSec=3
-
-#Systemd hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectControlGroups=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-LockPersonality=true
-RestrictSUIDSGID=true
-RemoveIPC=true
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
-
-[Install]
-WantedBy=multi-user.target
-
-13. Enable and start the service:
+15. Enable and start the service:
 
 sudo systemctl daemon-reload
 sudo systemctl enable raspberryfluke.service
