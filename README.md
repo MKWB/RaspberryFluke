@@ -2,6 +2,8 @@
 
 Pocket network diagnostic tool that displays LLDP/CDP switch data using a Raspberry Pi Zero 2 W, a PoE HAT, and an E-Paper display.
 
+Inspired by the functionality of commercial network port identification tools used by field technicians.
+
 ---
 
 ## Overview
