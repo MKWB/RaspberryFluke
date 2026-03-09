@@ -37,18 +37,20 @@ The goal was to build a simple, practical tool using inexpensive and widely avai
 
 ## Display Output
 
+```text
 SW: SWITCH-01  
 IP: 10.10.1.2  
 PORT: Gi1/0/24  
 VLAN: 120  
 VOICE: 130
+```
 
 ---
 
 ## Hardware
 
 - Raspberry Pi Zero 2 W
-- 40-pin Male GPIO Header
+- 40-pin male GPIO Header
 - Waveshare 2.13" E-Paper HAT+ display (SKU 27467)
 - Waveshare PoE Ethernet / USB HUB BOX (SKU 20895)
 
@@ -82,68 +84,95 @@ The script extracts relevant switch information such as hostname, IP address, po
 
 2. Boot the Raspberry Pi and update the system:
 
+```bash
 sudo apt update
 sudo apt upgrade -y
+```
 
 3. Install required packages:
 
+```bash
 sudo apt -y install git lldpd python3 python3-pip python3-pil python3-lgpio python3-rpi.gpio
+```
 
 4. Enable SPI (required for the E-Paper display):
 
+```bash
 sudo raspi-config
+```
 
 Navigate to:
 Interface Options -> SPI -> Enable
 
 5. Reboot the device
 
+```bash
 sudo reboot
+```
 
 6. Configure lldpd for CDP and receive-only mode:
 
+```bash
 sudo nano /etc/default/lldpd
-
+```
 Set:
 
+```ini
 DAEMON_ARGS="-r -c"
 LLDPD_OPTIONS=""
+```
 
 7. Restart lldpd:
 
+```bash
 sudo systemctl restart lldpd
+```
 
 8. Clone the RaspberryFluke repository into /opt:
 
+```bash
 sudo rm -rf /opt/raspberryfluke
 sudo git clone https://github.com/MKWB/raspberryfluke.git /opt/raspberryfluke
 sudo chown -R root:root /opt/raspberryfluke
+```
 
 9. Clone the Waveshare repository:
 
+```bash
 cd ~
 git clone https://github.com/waveshare/e-Paper.git
+```
 
 10. Copy the waveshare_epd library into /opt/raspberryfluke:
 
+```bash
 sudo cp -r ~/e-Paper/RaspberryPi_JetsonNano/python/lib/waveshare_epd /opt/raspberryfluke/
+```
 
 11. Make the script executable:
 
+```bash
 sudo chmod 755 /opt/raspberryfluke/raspberryfluke.py
+```
 
 12. Install the System Service File
 
+```bash
 sudo cp /opt/raspberryfluke/raspberryfluke.service /etc/systemd/system/
+```
 
-15. Enable and start the service:
+13. Enable and start the service:
 
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable raspberryfluke.service
 sudo systemctl start raspberryfluke.service
+```
 
 14. Verify the service is running:
 
+```bash
 sudo systemctl status raspberryfluke.service
+```
 
 The RaspberryFluke script will now run automatically each time the device boots.
