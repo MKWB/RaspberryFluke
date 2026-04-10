@@ -138,18 +138,59 @@ sudo git clone https://github.com/MKWB/RaspberryFluke.git /opt/raspberryfluke
 sudo chown -R root:root /opt/raspberryfluke
 ```
 
-9. Clone the Waveshare repository:
+9. Install the drivers for the Waveshare screen you are using:
 
-```bash
-cd ~
-git clone https://github.com/waveshare/e-Paper.git
-```
+    Waveshare 2.13" E-Paper HAT+ display:
 
-10. Copy the waveshare_epd library into /opt/raspberryfluke:
+    ```bash
+    cd ~
+    git clone https://github.com/waveshare/e-Paper.git
+    ```
+    Copy the waveshare_epd library into /opt/raspberryfluke:
 
-```bash
-sudo cp -r ~/e-Paper/RaspberryPi_JetsonNano/python/lib/waveshare_epd /opt/raspberryfluke/
-```
+        ```bash
+        sudo cp -r ~/e-Paper/RaspberryPi_JetsonNano/python/lib/waveshare_epd /opt/raspberryfluke/
+        ```
+
+    OR
+
+    Waveshare 1.44inch LCD display HAT:
+    
+    ```bash
+    cd ~
+    wget https://files.waveshare.com/upload/f/fa/1.44inch-LCD-HAT-Code.7z
+    7z x 1.44inch-LCD-HAT-Code.7z
+    ```
+    Create folder for LCD files and move files to this folder:
+
+        ```bash
+        sudo mkdir -p /opt/raspberryfluke/waveshare_lcd
+        ```
+
+    Copy the LCD driver files into the waveshare_lcd folder:
+        ```bash
+        sudo cp ~/1.44inch-LCD-HAT-Code/RaspberryPi/python/LCD_1in44.py /opt/raspberryfluke/waveshare_lcd/
+        sudo cp ~/1.44inch-LCD-HAT-Code/RaspberryPi/python/config.py /opt/raspberryfluke/waveshare_lcd/
+        ```
+
+    Create the package marker file for the waveshare_lcd folder:
+        ```bash
+        sudo touch /opt/raspberryfluke/waveshare_lcd/__init__.py
+        ```
+    
+    Open LCD_1in44.py
+        ```bash
+        cd /opt/raspberryfluke
+        sudo nano waveshare_lcd/LCD_1in44.py
+        ```
+    Change "import config" to "from . import config" 
+    Ctrl + O
+    Enter
+    Ctrl + X
+
+
+10. 
+
 
 11. Make the script executable:
 

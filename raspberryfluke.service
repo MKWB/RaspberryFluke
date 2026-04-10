@@ -1,5 +1,5 @@
 [Unit]
-Description=RaspberryFluke LLDP/CDP E-Paper Display
+Description=RaspberryFluke network discovery display service
 After=network.target lldpd.service
 Wants=lldpd.service
 
@@ -9,7 +9,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/raspberryfluke
 Environment=PYTHONPATH=/opt/raspberryfluke
-ExecStart=/usr/bin/python3 /opt/raspberryfluke/raspberryfluke.py
+ExecStart=/usr/bin/python3 /opt/raspberryfluke/main.py
 Restart=on-failure
 RestartSec=3
 

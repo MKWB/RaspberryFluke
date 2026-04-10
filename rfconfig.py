@@ -87,6 +87,9 @@ LCD_BACKLIGHT_BRIGHTNESS = 100
 # Main network interface to monitor.
 NETWORK_INTERFACE = "eth0"
 
+# Maximum number of seconds to wait for lldpctl to return.
+CAPTURE_TIMEOUT = 5
+
 # How often the main program checks for new display-worthy data.
 POLL_INTERVAL = 10
 
@@ -98,5 +101,6 @@ DISCOVERY_TIMEOUT = 180
 #   "dev"       = more verbose logging
 APP_MODE = "appliance"
 
-# Log level used if logging is added later.
-LOG_LEVEL = "INFO"
+# Leave blank to let APP_MODE decide automatically.
+# Valid examples: "DEBUG", "INFO", "WARNING", "ERROR"
+LOG_LEVEL = ""
