@@ -40,6 +40,7 @@ The goal was to build a simple, practical tool using inexpensive and widely avai
 ## Display Output
 
 ```text
+RaspberryFluke
 SW: SWITCH-01  
 IP: 10.10.1.2  
 PORT: Gi1/0/24  
@@ -94,7 +95,7 @@ sudo apt upgrade -y
 3. Install required packages:
 
 ```bash
-sudo apt -y install git lldpd python3 python3-pip python3-pil python3-lgpio python3-rpi.gpio
+sudo apt -y install git lldpd python3 python3-pip python3-pil python3-spidev python3-lgpio python3-rpi.gpio python3-numpy
 ```
 
 4. Enable SPI (required for the E-Paper display):
@@ -142,10 +143,10 @@ sudo chown -R root:root /opt/raspberryfluke
 
     Waveshare 2.13" E-Paper HAT+ display:
 
-    ```bash
-    cd ~
-    git clone https://github.com/waveshare/e-Paper.git
-    ```
+        ```bash
+        cd ~
+        git clone https://github.com/waveshare/e-Paper.git
+        ```
     Copy the waveshare_epd library into /opt/raspberryfluke:
 
         ```bash
@@ -155,56 +156,75 @@ sudo chown -R root:root /opt/raspberryfluke
     OR
 
     Waveshare 1.44inch LCD display HAT:
-    
-    ```bash
-    cd ~
-    wget https://files.waveshare.com/upload/f/fa/1.44inch-LCD-HAT-Code.7z
-    7z x 1.44inch-LCD-HAT-Code.7z
-    ```
-    Create folder for LCD files and move files to this folder:
-
-        ```bash
-        sudo mkdir -p /opt/raspberryfluke/waveshare_lcd
-        ```
-
-    Copy the LCD driver files into the waveshare_lcd folder:
-        ```bash
-        sudo cp ~/1.44inch-LCD-HAT-Code/RaspberryPi/python/LCD_1in44.py /opt/raspberryfluke/waveshare_lcd/
-        sudo cp ~/1.44inch-LCD-HAT-Code/RaspberryPi/python/config.py /opt/raspberryfluke/waveshare_lcd/
-        ```
-
-    Create the package marker file for the waveshare_lcd folder:
-        ```bash
-        sudo touch /opt/raspberryfluke/waveshare_lcd/__init__.py
-        ```
-    
-    Open LCD_1in44.py
-        ```bash
-        cd /opt/raspberryfluke
-        sudo nano waveshare_lcd/LCD_1in44.py
-        ```
-    Change "import config" to "from . import config" 
-    Ctrl + O
-    Enter
-    Ctrl + X
 
 
-10. 
+        Install the archive extractor if needed:
+
+            ```bash
+            sudo apt update
+            sudo apt install -y p7zip-full
+            ```
+
+        Download and extract the vendor code:
+
+            ```bash
+            cd ~
+            wget https://files.waveshare.com/upload/f/fa/1.44inch-LCD-HAT-Code.7z
+            7z x 1.44inch-LCD-HAT-Code.7z
+            ```
+
+        Create the folder for the LCD driver files:
+
+            ```bash
+            sudo mkdir -p /opt/raspberryfluke/waveshare_lcd
+            ```
+
+        Copy the LCD driver files into that folder:
+
+            ```bash
+            sudo cp ~/1.44inch-LCD-HAT-Code/RaspberryPi/python/LCD_1in44.py /opt/raspberryfluke/waveshare_lcd/
+            sudo cp ~/1.44inch-LCD-HAT-Code/RaspberryPi/python/config.py /opt/raspberryfluke/waveshare_lcd/
+            ```
+
+        Create the package marker file:
+
+            ```bash
+            sudo touch /opt/raspberryfluke/waveshare_lcd/__init__.py
+            ```
+
+        Open `LCD_1in44.py`:
+
+            ```bash
+            cd /opt/raspberryfluke
+            sudo nano waveshare_lcd/LCD_1in44.py
+            ```
+
+        Change this line:
+
+            ```python
+            import config
+            ```
+
+            to this:
+
+            ```python
+            from . import config
+            ```
+
+        Save and exit:
+
+            * `Ctrl + O`
+            * `Enter`
+            * `Ctrl + X`
 
 
-11. Make the script executable:
-
-```bash
-sudo chmod 755 /opt/raspberryfluke/raspberryfluke.py
-```
-
-12. Install the System Service File
+10. Install the System Service File
 
 ```bash
 sudo cp /opt/raspberryfluke/raspberryfluke.service /etc/systemd/system/
 ```
 
-13. Enable and start the service:
+11. Enable and start the service:
 
 ```bash
 sudo systemctl daemon-reload
@@ -212,7 +232,7 @@ sudo systemctl enable raspberryfluke.service
 sudo systemctl start raspberryfluke.service
 ```
 
-14. Verify the service is running:
+12. Verify the service is running:
 
 ```bash
 sudo systemctl status raspberryfluke.service
