@@ -34,10 +34,16 @@ class EPaperDisplay:
     LEFT_MARGIN = 10
     TOP_MARGIN = 4
 
-    # Font settings matched to the OG raspberryfluke.py behavior.
+    # Font settings for the body lines.
     BASE_FONT_SIZE = 16
     MIN_FONT_SIZE = 10
     LINE_SPACING = 2
+
+    # Fixed header settings.
+    TITLE_TEXT = "RaspberryFluke"
+    TITLE_FONT_SIZE = 16
+    TITLE_UNDERLINE_GAP = 1
+    TITLE_BODY_GAP = 2
 
     # Default font file.
     DEFAULT_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -83,18 +89,21 @@ class EPaperDisplay:
         self.initialized = False
         self.sleeping = False
 
-        # Save the last 5 lines shown on screen.
+        # Save the last 5 body lines shown on screen.
         self.last_lines = None
 
         # Save the last refresh time.
         self.last_refresh_time = 0.0
 
-        # Preload the font sizes once so we do not repeatedly read from disk.
+        # Preload the body font sizes once so we do not repeatedly read from disk.
         self.font_cache = self._build_font_cache()
+
+        # Load the fixed title font once.
+        self.title_font = self._load_title_font()
 
     def _build_font_cache(self):
         """
-        Preload the font sizes used by the display.
+        Preload the body font sizes used by the display.
 
         If the font file cannot be loaded, fall back to PIL's default font.
         """
@@ -109,6 +118,17 @@ class EPaperDisplay:
                 cache[size] = default_font
 
         return cache
+
+    def _load_title_font(self):
+        """
+        Load the fixed font used for the header.
+
+        If the configured font file cannot be loaded, fall back to PIL's default font.
+        """
+        try:
+            return ImageFont.truetype(self.font_path, self.TITLE_FONT_SIZE)
+        except OSError:
+            return ImageFont.load_default()
 
     def initialize(self, clear_on_start=False):
         """
@@ -217,7 +237,12 @@ class EPaperDisplay:
         Show text on the e-paper display.
 
         lines:
-            A list of text lines to show on the screen.
+            A list of body lines to show on the screen.
+            For normal neighbor screens, this should be:
+            SW / IP / PORT / VLAN / VOICE
+
+            For startup screens, if the first line is "RaspberryFluke",
+            it will be treated as the header and will not be drawn twice.
 
         force:
             If True, refresh no matter what.
@@ -229,7 +254,7 @@ class EPaperDisplay:
         with self.lock:
             normalized_lines = self._normalize_lines(lines)
 
-            # If the text is exactly the same as last time, skip it.
+            # If the body text is exactly the same as last time, skip it.
             if not force and normalized_lines == self.last_lines:
                 return False
 
@@ -243,11 +268,11 @@ class EPaperDisplay:
 
             self._ensure_awake()
 
-            image = self._render_image(normalized_lines)
+            image = self._render_image(lines)
             buffer = self.epd.getbuffer(image)
             self.epd.display(buffer)
 
-            # Save what is now on the screen.
+            # Save only the normalized body lines.
             self.last_lines = normalized_lines
             self.last_refresh_time = time.monotonic()
 
@@ -262,29 +287,67 @@ class EPaperDisplay:
         """
         Turn the text lines into an image.
 
-        This matches the OG behavior more closely:
-        - choose font size per line
-        - fit based on width for each individual line
-        - advance Y using font.size + LINE_SPACING
+        Behavior:
+        - Draw a fixed header at the top
+        - Center the header
+        - Underline the header
+        - Keep the header at a fixed size
+        - Fit each body line independently
         """
         image = Image.new("1", (self.DISPLAY_WIDTH, self.DISPLAY_HEIGHT), 255)
         draw = ImageDraw.Draw(image)
 
-        y = self.TOP_MARGIN
+        header_text, body_lines = self._split_header_and_body(lines)
+
+        # Draw centered fixed-size header.
+        header_width = draw.textlength(header_text, font=self.title_font)
+        header_x = int((self.DISPLAY_WIDTH - header_width) / 2)
+        header_y = self.TOP_MARGIN
+
+        draw.text((header_x, header_y), header_text, font=self.title_font, fill=0)
+
+        header_bbox = draw.textbbox((header_x, header_y), header_text, font=self.title_font)
+        underline_y = header_bbox[3] + self.TITLE_UNDERLINE_GAP
+        draw.line((header_bbox[0], underline_y, header_bbox[2], underline_y), fill=0, width=1)
+
+        # Start body below the underlined header.
+        y = underline_y + self.TITLE_BODY_GAP
         max_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
 
-        for line in lines:
+        for line in body_lines:
             font = self._fit_font_for_line(draw, line, max_width)
             draw.text((self.LEFT_MARGIN, y), line, font=font, fill=0)
             y += font.size + self.LINE_SPACING
 
         return image.rotate(180)
 
+    def _split_header_and_body(self, lines):
+        """
+        Split incoming lines into a header and 5 body lines.
+
+        Rules:
+        - If the first provided line is exactly "RaspberryFluke",
+          treat it as the header text and use the remaining lines as body text.
+        - Otherwise, use the default fixed header and treat all provided lines
+          as body lines.
+
+        This lets old startup screens keep working without drawing the title twice.
+        """
+        incoming = list(lines)
+
+        if incoming and str(incoming[0]).strip() == self.TITLE_TEXT:
+            header_text = self.TITLE_TEXT
+            body_source = incoming[1:]
+        else:
+            header_text = self.TITLE_TEXT
+            body_source = incoming
+
+        body_lines = self._normalize_body_lines(body_source)
+        return header_text, body_lines
+
     def _fit_font_for_line(self, draw, text, max_width):
         """
-        Pick the largest font size that fits within max_width for this one line.
-
-        This matches the OG raspberryfluke.py behavior.
+        Pick the largest body font size that fits within max_width for this one line.
         """
         for size in range(self.BASE_FONT_SIZE, self.MIN_FONT_SIZE - 1, -1):
             font = self.font_cache[size]
@@ -294,12 +357,12 @@ class EPaperDisplay:
 
         return self.font_cache[self.MIN_FONT_SIZE]
 
-    def _normalize_lines(self, lines, max_lines=5):
+    def _normalize_body_lines(self, lines, max_lines=5):
         """
-        Clean up the lines before drawing them.
+        Clean up the body lines before drawing them.
 
         What this does:
-        - Keep only the first 5 lines
+        - Keep only the first 5 body lines
         - Turn None into blank text
         - Remove extra spaces
         - Add blank lines if fewer than 5 were provided
@@ -317,14 +380,25 @@ class EPaperDisplay:
 
         return cleaned
 
+    def _normalize_lines(self, lines):
+        """
+        Return the normalized 5 body lines used for internal comparison.
+
+        This ignores the fixed header because the header does not participate in
+        VLAN/VOICE comparisons or body-line redraw checks.
+        """
+        _header_text, body_lines = self._split_header_and_body(lines)
+        return body_lines
+
     def _important_fields_changed(self, new_lines):
         """
         Check whether VLAN or VOICE changed compared to the previous screen.
 
-        line 4 = VLAN
-        line 5 = VOICE
+        With the fixed header design, new_lines contains body lines only:
 
-        Using zero-based indexes:
+        index 0 = SW
+        index 1 = IP
+        index 2 = PORT
         index 3 = VLAN
         index 4 = VOICE
         """
@@ -367,7 +441,7 @@ class EPaperDisplay:
         """
         Refresh the current screen contents again.
 
-        This redraws the same text on purpose.
+        This redraws the same body lines on purpose.
         """
         with self.lock:
             if self.last_lines is None:
