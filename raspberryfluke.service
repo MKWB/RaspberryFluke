@@ -1,7 +1,7 @@
 [Unit]
 Description=RaspberryFluke network discovery display service
 After=network.target lldpd.service
-Wants=lldpd.service
+Requires=lldpd.service
 
 [Service]
 Type=simple
@@ -20,6 +20,7 @@ ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
+ProtectClock=true
 LockPersonality=true
 RestrictSUIDSGID=true
 RemoveIPC=true

@@ -14,116 +14,33 @@ Important:
 - This parser should be tolerant of missing fields.
 - It should return useful partial results whenever possible.
 - Blank values should remain blank instead of causing errors.
+
+Important design note:
+- lldpctl often normalizes neighbor data into a shared key space.
+- Because of that, useful fields can exist even when the raw output does not
+  prove the source was truly CDP.
+- This parser is therefore intentionally conservative about labeling a result
+  as source='CDP'.
 """
 
 from __future__ import annotations
 
 import logging
 
+from parse_utils import (
+    build_interface_key,
+    get_first_value,
+    get_protocol_hint_value,
+    has_interface_keys,
+    normalize_interface,
+    normalize_vlan_value,
+    parse_keyvalue_output,
+    shorten_interface_name,
+    strip_domain,
+)
+
 
 log = logging.getLogger(__name__)
-
-
-def parse_keyvalue_output(raw_output: str) -> dict[str, str]:
-    """
-    Convert raw `lldpctl -f keyvalue` text into a dictionary.
-
-    Example input line:
-        lldp.eth0.chassis.name=Switch-01
-
-    Returns:
-        A dictionary where the key is the full lldpctl key and the value is the
-        text after the first "=" character.
-
-    Notes:
-        - Lines without "=" are ignored.
-        - Leading/trailing whitespace is stripped.
-        - Empty values are allowed.
-    """
-    parsed: dict[str, str] = {}
-
-    if not raw_output:
-        return parsed
-
-    for line in raw_output.splitlines():
-        line = line.strip()
-
-        if not line or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        parsed[key.strip()] = value.strip()
-
-    return parsed
-
-
-def get_first_value(data: dict[str, str], keys: list[str]) -> str:
-    """
-    Return the first non-empty value found from the provided keys.
-    """
-    for key in keys:
-        value = data.get(key, "").strip()
-        if value:
-            return value
-    return ""
-
-
-def build_interface_key(interface: str, suffix: str) -> str:
-    """
-    Build one lldpctl key for the selected interface.
-
-    Example:
-        interface="eth0", suffix="chassis.name"
-        -> "lldp.eth0.chassis.name"
-    """
-    return f"lldp.{interface}.{suffix}"
-
-
-def strip_domain(hostname: str) -> str:
-    """
-    Strip the domain portion from a hostname.
-
-    Example:
-        switch01.example.local -> switch01
-    """
-    if not hostname:
-        return ""
-
-    return hostname.split(".", 1)[0].strip()
-
-
-def shorten_interface_name(port_name: str) -> str:
-    """
-    Shorten long interface names to something that fits better on the display.
-
-    Examples:
-        GigabitEthernet1/0/24 -> Gi1/0/24
-        TenGigabitEthernet1/1/1 -> Te1/1/1
-        FastEthernet0/1 -> Fa0/1
-
-    If no known long prefix is found, the original value is returned.
-    """
-    if not port_name:
-        return ""
-
-    replacements = {
-        "TwentyFiveGigE": "Twe",
-        "TwentyFiveGigabitEthernet": "Twe",
-        "FortyGigabitEthernet": "Fo",
-        "HundredGigE": "Hu",
-        "HundredGigabitEthernet": "Hu",
-        "TenGigabitEthernet": "Te",
-        "GigabitEthernet": "Gi",
-        "FastEthernet": "Fa",
-        "Ethernet": "Eth",
-        "Port-Channel": "Po",
-    }
-
-    for long_name, short_name in replacements.items():
-        if port_name.startswith(long_name):
-            return port_name.replace(long_name, short_name, 1)
-
-    return port_name
 
 
 def extract_switch_name(data: dict[str, str], interface: str) -> str:
@@ -148,9 +65,6 @@ def extract_switch_name(data: dict[str, str], interface: str) -> str:
 def extract_switch_ip(data: dict[str, str], interface: str) -> str:
     """
     Extract the CDP neighbor management IP address.
-
-    CDP commonly exposes management/address information through chassis
-    mgmt-ip in lldpctl keyvalue output.
     """
     return get_first_value(
         data,
@@ -184,70 +98,73 @@ def extract_vlan(data: dict[str, str], interface: str) -> str:
     """
     Extract the primary/data VLAN from CDP-related data.
 
-    VLAN reporting can vary depending on device and lldpd exposure.
-    These are reasonable keys to try first.
+    Prefer actual VLAN ID fields over looser text fields.
     """
-    return get_first_value(
+    vlan_value = get_first_value(
         data,
         [
-            build_interface_key(interface, "vlan.pvid"),
             build_interface_key(interface, "vlan.vlan-id"),
             build_interface_key(interface, "port.vlan"),
+            build_interface_key(interface, "vlan"),
         ],
     )
+
+    return normalize_vlan_value(vlan_value)
 
 
 def extract_voice_vlan(data: dict[str, str], interface: str) -> str:
     """
     Extract the voice VLAN from CDP-related data when available.
 
-    CDP voice VLAN exposure may vary, so this may need tuning once you inspect
-    real keyvalue output from your environment.
+    CDP voice VLAN exposure may vary. We check a few likely candidates and keep
+    this tolerant rather than strict.
     """
-    return get_first_value(
+    voice_vlan = get_first_value(
         data,
         [
+            build_interface_key(interface, "cdp.voice-vlan"),
             build_interface_key(interface, "port.policy.voice.vid"),
             build_interface_key(interface, "port.policy.vid"),
             build_interface_key(interface, "med.policy.voice.vid"),
             build_interface_key(interface, "med.policy.vid"),
-            build_interface_key(interface, "cdp.voice-vlan"),
         ],
     )
+
+    return normalize_vlan_value(voice_vlan)
+
+
+def has_explicit_cdp_keys(data: dict[str, str], interface: str) -> bool:
+    """
+    Return True if the parsed key set contains an explicitly CDP-named key.
+
+    This is a stronger signal than simply seeing useful chassis/port values.
+    """
+    interface = normalize_interface(interface)
+    explicit_prefix = f"lldp.{interface}.cdp."
+
+    return any(key.startswith(explicit_prefix) for key in data)
 
 
 def looks_like_cdp_neighbor(data: dict[str, str], interface: str) -> bool:
     """
-    Make a best-effort guess about whether the captured neighbor data is CDP.
+    Make a conservative decision about whether the captured neighbor data is CDP.
 
-    Important:
-    lldpctl may normalize CDP and LLDP into similar key names, so detecting the
-    source is not always perfect from keyvalue output alone.
+    High-confidence CDP signals:
+    - an explicit protocol/source hint contains "cdp"
+    - an explicit CDP-specific key exists for the interface
 
-    We therefore look for hints that often appear with Cisco/CDP neighbors.
-
-    This function is intentionally conservative:
-    - if we see an explicit CDP-like hint, return True
-    - otherwise, return False
+    We intentionally do NOT treat generic Cisco-looking text alone as proof of
+    CDP because the same device may also advertise via LLDP.
     """
-    cdp_hint_keys = [
-        build_interface_key(interface, "chassis.descr"),
-        build_interface_key(interface, "chassis.name"),
-        build_interface_key(interface, "port.descr"),
-    ]
+    protocol_hint = get_protocol_hint_value(data, interface).lower()
 
-    hint_text = " ".join(data.get(key, "") for key in cdp_hint_keys).lower()
+    if "cdp" in protocol_hint:
+        return True
 
-    cisco_markers = [
-        "cisco",
-        "ios",
-        "nx-os",
-        "ios-xe",
-        "ios xe",
-        "catalyst",
-    ]
+    if has_explicit_cdp_keys(data, interface):
+        return True
 
-    return any(marker in hint_text for marker in cisco_markers)
+    return False
 
 
 def parse_cdp_data(raw_output: str, interface: str = "eth0") -> dict[str, str]:
@@ -275,9 +192,8 @@ def parse_cdp_data(raw_output: str, interface: str = "eth0") -> dict[str, str]:
         - Missing fields are returned as empty strings.
         - This parser only extracts CDP-related information as best as possible
           from lldpctl keyvalue output.
-        - It does not decide whether CDP wins over LLDP.
         - Because lldpctl often normalizes neighbor output, true source
-          identification is best-effort rather than guaranteed.
+          identification is intentionally conservative.
     """
     result = {
         "source": "",
@@ -292,13 +208,10 @@ def parse_cdp_data(raw_output: str, interface: str = "eth0") -> dict[str, str]:
         log.debug("parse_cdp_data called with empty raw output")
         return result
 
-    interface = str(interface).strip() or "eth0"
+    interface = normalize_interface(interface)
     data = parse_keyvalue_output(raw_output)
 
-    interface_prefix = f"lldp.{interface}."
-    has_neighbor_keys = any(key.startswith(interface_prefix) for key in data)
-
-    if not has_neighbor_keys:
+    if not has_interface_keys(data, interface):
         log.debug("No neighbor keys detected in raw keyvalue output for interface %s", interface)
         return result
 
@@ -318,12 +231,10 @@ def parse_cdp_data(raw_output: str, interface: str = "eth0") -> dict[str, str]:
 
     if any(useful_fields) and looks_like_cdp_neighbor(data, interface):
         result["source"] = "CDP"
-        log.debug("Parsed CDP data on %s: %s", interface, result)
+        log.debug("Parsed high-confidence CDP data on %s: %s", interface, result)
     elif any(useful_fields):
-        # Leave source blank if we found useful data but cannot confidently say
-        # it is CDP. This prevents falsely labeling normalized neighbor data.
         log.debug(
-            "Useful neighbor fields found on %s, but source did not clearly look like CDP",
+            "Useful neighbor fields found on %s, but the data did not provide a high-confidence CDP signal",
             interface,
         )
     else:

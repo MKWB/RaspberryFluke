@@ -24,6 +24,8 @@ import threading
 from PIL import Image, ImageDraw, ImageFont
 from waveshare_lcd import LCD_1in44
 
+from parse_utils import shorten_interface_name
+
 
 class LCDDisplay:
     # Screen size in pixels for the Waveshare 1.44" LCD HAT.
@@ -98,6 +100,27 @@ class LCDDisplay:
 
         # LCD driver object gets created during initialize().
         self.lcd = None
+
+        # Preload font sizes once so we do not repeatedly read from disk.
+        self.font_cache = self._build_font_cache()
+
+    def _build_font_cache(self):
+        """
+        Preload the font sizes used by the LCD.
+
+        If the font file cannot be loaded, fall back to PIL's default font.
+        """
+        cache = {}
+
+        try:
+            for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
+                cache[size] = ImageFont.truetype(self.font_path, size)
+        except OSError:
+            default_font = ImageFont.load_default()
+            for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
+                cache[size] = default_font
+
+        return cache
 
     def initialize(self):
         """
@@ -361,37 +384,11 @@ class LCDDisplay:
         prepared = []
 
         for line in lines:
-            shortened = self._abbreviate_terms(line)
+            shortened = shorten_interface_name(line)
             shortened = self._truncate_to_width(draw, shortened, font, usable_width)
             prepared.append(shortened)
 
         return prepared
-
-    def _abbreviate_terms(self, text):
-        """
-        Shorten a few known long interface terms so they fit better.
-
-        This is display formatting only.
-        """
-        replacements = {
-            "TenGigabitEthernet": "Te",
-            "GigabitEthernet": "Gi",
-            "FastEthernet": "Fa",
-            "TwentyFiveGigE": "Twe",
-            "TwentyFiveGigabitEthernet": "Twe",
-            "FortyGigabitEthernet": "Fo",
-            "HundredGigE": "Hu",
-            "HundredGigabitEthernet": "Hu",
-            "Port-channel": "Po",
-            "Port-Channel": "Po",
-            "Ethernet": "Eth",
-        }
-
-        result = text
-        for old, new in replacements.items():
-            result = result.replace(old, new)
-
-        return result
 
     def _truncate_to_width(self, draw, text, font, usable_width):
         """
@@ -458,15 +455,13 @@ class LCDDisplay:
 
     def _get_font(self, size):
         """
-        Load the font file.
+        Return a cached font object for the requested size.
 
-        If the font file is missing, use the default PIL font
-        so the program does not crash.
+        If the requested size is outside the configured range,
+        clamp it to the nearest valid size.
         """
-        try:
-            return ImageFont.truetype(self.font_path, size)
-        except OSError:
-            return ImageFont.load_default()
+        size = max(self.MIN_FONT_SIZE, min(self.BASE_FONT_SIZE, int(size)))
+        return self.font_cache[size]
 
     def _set_backlight(self, on):
         """

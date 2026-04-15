@@ -9,7 +9,7 @@ What this file does:
 - Show that image on the screen
 - Limit how often the screen refreshes
 - Force a refresh when VLAN or VOICE changes
-- Put the display to sleep when not actively updating
+- Put the display to sleep when appropriate
 
 What this file does NOT do:
 - Read config files
@@ -34,7 +34,7 @@ class EPaperDisplay:
     LEFT_MARGIN = 10
     TOP_MARGIN = 4
 
-    # Font settings.
+    # Font settings matched to the OG raspberryfluke.py behavior.
     BASE_FONT_SIZE = 16
     MIN_FONT_SIZE = 10
     LINE_SPACING = 2
@@ -47,6 +47,7 @@ class EPaperDisplay:
         font_path=None,
         min_refresh_interval=10,
         auto_sleep=True,
+        startup_mode=True,
     ):
         """
         Set up the display object.
@@ -58,11 +59,19 @@ class EPaperDisplay:
             Minimum number of seconds between normal display refreshes.
 
         auto_sleep:
-            If True, the panel goes back to sleep after each update.
+            If True, the panel goes back to sleep after normal updates.
+
+        startup_mode:
+            If True, the display stays in a startup-friendly mode where it can
+            remain awake between updates until the first real result is shown.
         """
         self.font_path = font_path or self.DEFAULT_FONT_PATH
         self.min_refresh_interval = min_refresh_interval
         self.auto_sleep = auto_sleep
+
+        # Startup mode is meant to reduce early boot churn.
+        # While enabled, we do not automatically sleep after each update.
+        self.startup_mode = startup_mode
 
         # Create the Waveshare display object.
         self.epd = epd2in13_V3.EPD()
@@ -78,14 +87,39 @@ class EPaperDisplay:
         self.last_lines = None
 
         # Save the last refresh time.
-        self.last_refresh_time = 0
+        self.last_refresh_time = 0.0
 
-    def initialize(self, clear_on_start=True):
+        # Preload the font sizes once so we do not repeatedly read from disk.
+        self.font_cache = self._build_font_cache()
+
+    def _build_font_cache(self):
+        """
+        Preload the font sizes used by the display.
+
+        If the font file cannot be loaded, fall back to PIL's default font.
+        """
+        cache = {}
+
+        try:
+            for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
+                cache[size] = ImageFont.truetype(self.font_path, size)
+        except OSError:
+            default_font = ImageFont.load_default()
+            for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
+                cache[size] = default_font
+
+        return cache
+
+    def initialize(self, clear_on_start=False):
         """
         Start the e-paper display.
 
         clear_on_start:
             If True, clear the screen to white when starting up.
+
+        For RaspberryFluke appliance use, this should usually stay False so we
+        can jump directly to a boot/listening screen instead of doing an extra
+        blank-screen refresh first.
         """
         with self.lock:
             if self.initialized and not self.sleeping:
@@ -104,6 +138,10 @@ class EPaperDisplay:
 
         sleep_after:
             If True, put the panel back to sleep after clearing.
+
+        Note:
+            For this project, clearing on startup is usually not ideal.
+            The appliance should normally jump straight to a startup screen.
         """
         with self.lock:
             self._ensure_awake()
@@ -114,7 +152,7 @@ class EPaperDisplay:
             self.last_lines = ["", "", "", "", ""]
             self.last_refresh_time = time.monotonic()
 
-            if sleep_after and self.auto_sleep:
+            if sleep_after and self.auto_sleep and not self.startup_mode:
                 self.sleep()
 
     def sleep(self):
@@ -144,14 +182,35 @@ class EPaperDisplay:
                 return
 
             if clear_before_sleep:
-                self._ensure_awake()
-                self.epd.Clear(0xFF)
-                self.last_lines = ["", "", "", "", ""]
-                self.last_refresh_time = time.monotonic()
+                try:
+                    self._ensure_awake()
+                    self.epd.Clear(0xFF)
+                    self.last_lines = ["", "", "", "", ""]
+                    self.last_refresh_time = time.monotonic()
+                except Exception:
+                    pass
 
-            self.epd.sleep()
+            try:
+                self.epd.sleep()
+            except Exception:
+                pass
+
             self.sleeping = True
             self.initialized = False
+
+    def set_startup_mode(self, enabled):
+        """
+        Enable or disable startup mode.
+
+        Startup mode is intended for the early boot phase where we want the
+        display to remain responsive and avoid extra wake/sleep churn.
+
+        Typical use:
+        - startup_mode = True while booting and waiting for first discovery
+        - startup_mode = False after the first real neighbor result is shown
+        """
+        with self.lock:
+            self.startup_mode = bool(enabled)
 
     def show_lines(self, lines, force=False):
         """
@@ -192,30 +251,48 @@ class EPaperDisplay:
             self.last_lines = normalized_lines
             self.last_refresh_time = time.monotonic()
 
-            # Put the display back to sleep after updating.
-            if self.auto_sleep:
+            # During startup mode, keep the display awake so repeated early
+            # screen changes do not constantly reinitialize the panel.
+            if self.auto_sleep and not self.startup_mode:
                 self.sleep()
 
             return True
 
     def _render_image(self, lines):
         """
-        Turn the text lines into an image that fits the screen.
+        Turn the text lines into an image.
+
+        This matches the OG behavior more closely:
+        - choose font size per line
+        - fit based on width for each individual line
+        - advance Y using font.size + LINE_SPACING
         """
         image = Image.new("1", (self.DISPLAY_WIDTH, self.DISPLAY_HEIGHT), 255)
         draw = ImageDraw.Draw(image)
 
-        font = self._choose_font(draw, lines)
         y = self.TOP_MARGIN
+        max_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
 
         for line in lines:
+            font = self._fit_font_for_line(draw, line, max_width)
             draw.text((self.LEFT_MARGIN, y), line, font=font, fill=0)
+            y += font.size + self.LINE_SPACING
 
-            bbox = draw.textbbox((0, 0), line, font=font)
-            line_height = bbox[3] - bbox[1]
-            y += line_height + self.LINE_SPACING
+        return image.rotate(180)
 
-        return image
+    def _fit_font_for_line(self, draw, text, max_width):
+        """
+        Pick the largest font size that fits within max_width for this one line.
+
+        This matches the OG raspberryfluke.py behavior.
+        """
+        for size in range(self.BASE_FONT_SIZE, self.MIN_FONT_SIZE - 1, -1):
+            font = self.font_cache[size]
+
+            if draw.textlength(text, font=font) <= max_width:
+                return font
+
+        return self.font_cache[self.MIN_FONT_SIZE]
 
     def _normalize_lines(self, lines, max_lines=5):
         """
@@ -233,7 +310,7 @@ class EPaperDisplay:
             if line is None:
                 cleaned.append("")
             else:
-                cleaned.append(str(line).strip())
+                cleaned.append(" ".join(str(line).strip().split()))
 
         while len(cleaned) < max_lines:
             cleaned.append("")
@@ -261,54 +338,6 @@ class EPaperDisplay:
         new_voice = new_lines[4]
 
         return old_vlan != new_vlan or old_voice != new_voice
-
-    def _choose_font(self, draw, lines):
-        """
-        Pick the biggest font size that still fits on the screen.
-        """
-        for size in range(self.BASE_FONT_SIZE, self.MIN_FONT_SIZE - 1, -1):
-            font = self._get_font(size)
-
-            if self._lines_fit(draw, lines, font):
-                return font
-
-        return self._get_font(self.MIN_FONT_SIZE)
-
-    def _lines_fit(self, draw, lines, font):
-        """
-        Check if all lines fit on the screen.
-        """
-        usable_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
-        usable_height = self.DISPLAY_HEIGHT - self.TOP_MARGIN
-
-        total_height = 0
-
-        for index, line in enumerate(lines):
-            bbox = draw.textbbox((0, 0), line, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-
-            if text_width > usable_width:
-                return False
-
-            total_height += text_height
-
-            if index < len(lines) - 1:
-                total_height += self.LINE_SPACING
-
-        return total_height <= usable_height
-
-    def _get_font(self, size):
-        """
-        Load the font file.
-
-        If the font file is missing, use the default PIL font
-        so the program does not crash.
-        """
-        try:
-            return ImageFont.truetype(self.font_path, size)
-        except OSError:
-            return ImageFont.load_default()
 
     def _refresh_allowed(self):
         """
@@ -355,6 +384,7 @@ class EPaperDisplay:
             return {
                 "initialized": self.initialized,
                 "sleeping": self.sleeping,
+                "startup_mode": self.startup_mode,
                 "last_lines": self.last_lines,
                 "last_refresh_time": self.last_refresh_time,
                 "min_refresh_interval": self.min_refresh_interval,

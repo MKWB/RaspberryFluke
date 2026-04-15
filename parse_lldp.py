@@ -5,7 +5,7 @@ This module parses LLDP-related fields from raw `lldpctl -f keyvalue` output.
 
 Design goals:
 - Accept one raw text blob from capture.py
-- Extract only LLDP-related data
+- Extract only LLDP-related fields
 - Return partial structured data
 - Never update application state directly
 - Never talk to the display directly
@@ -14,127 +14,33 @@ Important:
 - This parser should be tolerant of missing fields.
 - It should return useful partial results whenever possible.
 - Blank values should remain blank instead of causing errors.
+
+Important design note:
+- lldpctl often normalizes neighbor output into a shared key space.
+- Because of that, useful fields can exist even when the raw output does not
+  explicitly prove the source was LLDP.
+- This parser stays tolerant for field extraction, while source labeling is
+  kept conservative.
 """
 
 from __future__ import annotations
 
 import logging
 
+from parse_utils import (
+    build_interface_key,
+    get_first_value,
+    get_protocol_hint_value,
+    has_interface_keys,
+    normalize_interface,
+    normalize_vlan_value,
+    parse_keyvalue_output,
+    shorten_interface_name,
+    strip_domain,
+)
+
 
 log = logging.getLogger(__name__)
-
-
-def parse_keyvalue_output(raw_output: str) -> dict[str, str]:
-    """
-    Convert raw `lldpctl -f keyvalue` text into a dictionary.
-
-    Example input line:
-        lldp.eth0.chassis.name=Switch-01
-
-    Returns:
-        A dictionary where the key is the full lldpctl key and the value is the
-        text after the first "=" character.
-
-    Notes:
-        - Lines without "=" are ignored.
-        - Leading/trailing whitespace is stripped.
-        - Empty values are allowed.
-    """
-    parsed: dict[str, str] = {}
-
-    if not raw_output:
-        return parsed
-
-    for line in raw_output.splitlines():
-        line = line.strip()
-
-        if not line or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        parsed[key.strip()] = value.strip()
-
-    return parsed
-
-
-def normalize_interface(interface: str) -> str:
-    """
-    Return a clean interface name.
-
-    Falls back to eth0 if the provided value is blank.
-    """
-    interface = str(interface).strip()
-    return interface or "eth0"
-
-
-def build_interface_key(interface: str, suffix: str) -> str:
-    """
-    Build one lldpctl key for the selected interface.
-
-    Example:
-        interface="eth0", suffix="chassis.name"
-        -> "lldp.eth0.chassis.name"
-    """
-    interface = normalize_interface(interface)
-    return f"lldp.{interface}.{suffix}"
-
-
-def get_first_value(data: dict[str, str], keys: list[str]) -> str:
-    """
-    Return the first non-empty value found from the provided keys.
-    """
-    for key in keys:
-        value = data.get(key, "").strip()
-        if value:
-            return value
-    return ""
-
-
-def strip_domain(hostname: str) -> str:
-    """
-    Strip the domain portion from a hostname.
-
-    Example:
-        switch01.example.local -> switch01
-    """
-    if not hostname:
-        return ""
-
-    return hostname.split(".", 1)[0].strip()
-
-
-def shorten_interface_name(port_name: str) -> str:
-    """
-    Shorten long interface names to something that fits better on the display.
-
-    Examples:
-        GigabitEthernet1/0/24 -> Gi1/0/24
-        TenGigabitEthernet1/1/1 -> Te1/1/1
-        FastEthernet0/1 -> Fa0/1
-
-    If no known long prefix is found, the original value is returned.
-    """
-    if not port_name:
-        return ""
-
-    replacements = {
-        "TwentyFiveGigE": "Twe",
-        "TwentyFiveGigabitEthernet": "Twe",
-        "FortyGigabitEthernet": "Fo",
-        "HundredGigE": "Hu",
-        "HundredGigabitEthernet": "Hu",
-        "TenGigabitEthernet": "Te",
-        "GigabitEthernet": "Gi",
-        "FastEthernet": "Fa",
-        "Ethernet": "Eth",
-        "Port-Channel": "Po",
-    }
-
-    for long_name, short_name in replacements.items():
-        if port_name.startswith(long_name):
-            return port_name.replace(long_name, short_name, 1)
-
-    return port_name
 
 
 def extract_switch_name(data: dict[str, str], interface: str) -> str:
@@ -190,16 +96,19 @@ def extract_vlan(data: dict[str, str], interface: str) -> str:
     """
     Extract the primary/data VLAN from LLDP information.
 
-    For this project, we usually prefer the PVID because that most closely
-    matches the access VLAN idea.
+    Prefer actual VLAN ID fields, but allow a port.vlan fallback so we do not
+    throw away usable normalized data.
     """
-    return get_first_value(
+    vlan_value = get_first_value(
         data,
         [
-            build_interface_key(interface, "vlan.pvid"),
             build_interface_key(interface, "vlan.vlan-id"),
+            build_interface_key(interface, "port.vlan"),
+            build_interface_key(interface, "vlan"),
         ],
     )
+
+    return normalize_vlan_value(vlan_value)
 
 
 def extract_voice_vlan(data: dict[str, str], interface: str) -> str:
@@ -207,9 +116,9 @@ def extract_voice_vlan(data: dict[str, str], interface: str) -> str:
     Extract the voice VLAN from LLDP-MED style policy fields when available.
 
     The exact key names can vary depending on vendor and lldpd version, so this
-    may need adjustment after testing against real device output.
+    remains intentionally tolerant.
     """
-    return get_first_value(
+    voice_vlan = get_first_value(
         data,
         [
             build_interface_key(interface, "port.policy.voice.vid"),
@@ -218,6 +127,22 @@ def extract_voice_vlan(data: dict[str, str], interface: str) -> str:
             build_interface_key(interface, "med.policy.vid"),
         ],
     )
+
+    return normalize_vlan_value(voice_vlan)
+
+
+def looks_like_lldp_neighbor(data: dict[str, str], interface: str) -> bool:
+    """
+    Make a conservative decision about whether the captured neighbor data is LLDP.
+
+    High-confidence LLDP signal:
+    - an explicit protocol/source hint contains "lldp"
+
+    If that signal is missing, we still extract fields, but we do not
+    automatically stamp the result as source='LLDP' here.
+    """
+    protocol_hint = get_protocol_hint_value(data, interface).lower()
+    return "lldp" in protocol_hint
 
 
 def parse_lldp_data(raw_output: str, interface: str = "eth0") -> dict[str, str]:
@@ -244,7 +169,8 @@ def parse_lldp_data(raw_output: str, interface: str = "eth0") -> dict[str, str]:
     Notes:
         - Missing fields are returned as empty strings.
         - This parser only extracts LLDP-related information.
-        - It does not decide whether LLDP wins over CDP.
+        - Because lldpctl often normalizes output, source labeling is kept
+          conservative while field extraction remains tolerant.
     """
     result = {
         "source": "",
@@ -262,10 +188,7 @@ def parse_lldp_data(raw_output: str, interface: str = "eth0") -> dict[str, str]:
     interface = normalize_interface(interface)
     data = parse_keyvalue_output(raw_output)
 
-    interface_prefix = f"lldp.{interface}."
-    has_lldp_keys = any(key.startswith(interface_prefix) for key in data)
-
-    if not has_lldp_keys:
+    if not has_interface_keys(data, interface):
         log.debug("No LLDP keys detected in raw keyvalue output for interface %s", interface)
         return result
 
@@ -283,9 +206,14 @@ def parse_lldp_data(raw_output: str, interface: str = "eth0") -> dict[str, str]:
         result["voice_vlan"],
     ]
 
-    if any(useful_fields):
+    if any(useful_fields) and looks_like_lldp_neighbor(data, interface):
         result["source"] = "LLDP"
-        log.debug("Parsed LLDP data on %s: %s", interface, result)
+        log.debug("Parsed high-confidence LLDP data on %s: %s", interface, result)
+    elif any(useful_fields):
+        log.debug(
+            "Useful neighbor fields found on %s, but the data did not provide a high-confidence LLDP signal",
+            interface,
+        )
     else:
         log.debug("LLDP keys existed on %s, but no useful LLDP fields were extracted", interface)
 

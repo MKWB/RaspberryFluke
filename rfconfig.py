@@ -26,15 +26,11 @@ What this file does NOT do:
 # Valid values:
 #   "epaper"  = Waveshare 2.13" V3 e-paper display
 #   "lcd"     = Waveshare 1.44" LCD HAT display
-#
-#      
 # ============================================================
 
 DISPLAY_TYPE = "epaper"
-#       
+
 # The e-paper display is the recommended display.
-# ============================================================
-# ============================================================
 
 
 # ============================================================
@@ -44,6 +40,41 @@ DISPLAY_TYPE = "epaper"
 # Optional font path used by both display types.
 # Leave this as-is unless you specifically want to use a different font.
 DISPLAY_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Main network interface to monitor.
+NETWORK_INTERFACE = "eth0"
+
+# Maximum number of seconds to wait for lldpctl to return during normal use.
+# Keep this fairly short so the appliance stays responsive.
+CAPTURE_TIMEOUT = 2
+
+# Fast poll interval used during startup before the first successful
+# neighbor discovery. Lower values help reduce time-to-info.
+STARTUP_POLL_INTERVAL = 1
+
+# Normal poll interval used after the first successful neighbor discovery.
+# This reduces unnecessary polling once useful data is already on screen.
+STEADY_POLL_INTERVAL = 10
+
+# How long the program waits before treating previously discovered neighbor
+# data as stale and clearing the active result.
+DISCOVERY_TIMEOUT = 180
+
+# If True, show a dedicated waiting-for-link screen when Ethernet carrier is down.
+WAITING_FOR_LINK_SCREEN = True
+
+# If True, show a dedicated waiting-for-discovery screen when link is up
+# but LLDP/CDP data has not been discovered yet.
+WAITING_FOR_DISCOVERY_SCREEN = True
+
+# Application mode:
+#   "appliance" = minimal logging
+#   "dev"       = more verbose logging
+APP_MODE = "appliance"
+
+# Leave blank to let APP_MODE decide automatically.
+# Valid examples: "DEBUG", "INFO", "WARNING", "ERROR"
+LOG_LEVEL = ""
 
 
 # ============================================================
@@ -77,30 +108,3 @@ LCD_TEXT_COLOR = (255, 255, 255)
 
 # LCD backlight brightness from 0 to 100.
 LCD_BACKLIGHT_BRIGHTNESS = 100
-
-
-# ============================================================
-# ------------------ FUTURE APP SETTINGS ---------------------
-# ============================================================
-# These are optional placeholders for later as the project grows.
-
-# Main network interface to monitor.
-NETWORK_INTERFACE = "eth0"
-
-# Maximum number of seconds to wait for lldpctl to return.
-CAPTURE_TIMEOUT = 5
-
-# How often the main program checks for new display-worthy data.
-POLL_INTERVAL = 10
-
-# How long the program waits for discovery data before timing out.
-DISCOVERY_TIMEOUT = 180
-
-# Application mode:
-#   "appliance" = minimal logging
-#   "dev"       = more verbose logging
-APP_MODE = "appliance"
-
-# Leave blank to let APP_MODE decide automatically.
-# Valid examples: "DEBUG", "INFO", "WARNING", "ERROR"
-LOG_LEVEL = ""
