@@ -46,8 +46,8 @@ class EPaperDisplay:
     LINE_SPACING   = 2
 
     # Fixed header drawn at the top of every screen.
-    TITLE_TEXT       = "RaspberryFluke"
-    TITLE_FONT_SIZE  = 16
+    TITLE_TEXT          = "RaspberryFluke"
+    TITLE_FONT_SIZE     = 16
     TITLE_UNDERLINE_GAP = 1
     TITLE_BODY_GAP      = 2
 
@@ -119,6 +119,10 @@ class EPaperDisplay:
         # Save the last refresh time.
         self.last_refresh_time = 0.0
 
+        # True after we have seeded the panel with a valid full/base image.
+        # Partial refreshes are not safe until this has happened.
+        self._partial_base_ready = False
+
         # Preload the body font sizes once so we do not repeatedly read from disk.
         self.font_cache = self._build_font_cache()
 
@@ -126,7 +130,7 @@ class EPaperDisplay:
         self.title_font = self._load_title_font()
 
     # ------------------------------------------------------------------ #
-    #  Public interface                                                    #
+    #  Public interface                                                   #
     # ------------------------------------------------------------------ #
 
     def initialize(self, clear_on_start=False):
@@ -149,6 +153,7 @@ class EPaperDisplay:
             # After any hardware init, the next display call must be a full
             # refresh to ensure a clean starting state.
             self.partial_refresh_count = self._partial_refresh_limit
+            self._partial_base_ready   = False
 
             if clear_on_start:
                 self.clear()
@@ -166,6 +171,7 @@ class EPaperDisplay:
             self.last_lines            = ["", "", "", "", ""]
             self.last_refresh_time     = time.monotonic()
             self.partial_refresh_count = self._partial_refresh_limit
+            self._partial_base_ready   = False
 
             if sleep_after and self.auto_sleep and not self.startup_mode:
                 self.sleep()
@@ -198,8 +204,10 @@ class EPaperDisplay:
                 try:
                     self._ensure_awake()
                     self.epd.Clear(0xFF)
-                    self.last_lines        = ["", "", "", "", ""]
-                    self.last_refresh_time = time.monotonic()
+                    self.last_lines          = ["", "", "", "", ""]
+                    self.last_refresh_time   = time.monotonic()
+                    self.partial_refresh_count = self._partial_refresh_limit
+                    self._partial_base_ready = False
                 except Exception:
                     pass
 
@@ -264,15 +272,22 @@ class EPaperDisplay:
             image  = self._render_image(normalized_lines)
             buffer = self.epd.getbuffer(image)
 
-            # Decide between partial and full refresh.
-            if self.partial_refresh_count >= self._partial_refresh_limit:
-                # Full refresh: clears ghosting, takes ~2-3 seconds.
-                self.epd.Clear(0xFF)
-                self.epd.display(buffer)
+            # During startup mode we stay conservative and use full refreshes
+            # only. The boot -> first-result transition happens quickly and is
+            # where partial refresh artifacts are most likely to show up.
+            use_full_refresh = self.startup_mode or self._must_do_full_refresh()
+
+            if use_full_refresh:
+                self._do_full_refresh(buffer)
                 self.partial_refresh_count = 0
-                log.debug("Full refresh performed (ghost prevention or first render)")
+                log.debug(
+                    "Full refresh performed "
+                    "(startup=%s, ghost_prevention=%s, base_ready=%s)",
+                    self.startup_mode,
+                    self.partial_refresh_count >= self._partial_refresh_limit,
+                    self._partial_base_ready,
+                )
             else:
-                # Partial refresh: faster, avoids full-screen flash.
                 try:
                     self.epd.displayPartial(buffer)
                     self.partial_refresh_count += 1
@@ -287,8 +302,7 @@ class EPaperDisplay:
                         "Partial refresh failed. Falling back to full refresh.",
                         exc_info=True,
                     )
-                    self.epd.Clear(0xFF)
-                    self.epd.display(buffer)
+                    self._do_full_refresh(buffer)
                     self.partial_refresh_count = 0
 
             self.last_lines        = normalized_lines
@@ -316,6 +330,7 @@ class EPaperDisplay:
 
             # Reset the counter so the forced refresh is always a full refresh.
             self.partial_refresh_count = self._partial_refresh_limit
+            self._partial_base_ready   = False
             return self.show_lines(self.last_lines, force=True)
 
     def get_status(self):
@@ -334,10 +349,11 @@ class EPaperDisplay:
                 "auto_sleep":              self.auto_sleep,
                 "partial_refresh_count":   self.partial_refresh_count,
                 "partial_refresh_limit":   self._partial_refresh_limit,
+                "partial_base_ready":      self._partial_base_ready,
             }
 
     # ------------------------------------------------------------------ #
-    #  Private helpers                                                     #
+    #  Private helpers                                                    #
     # ------------------------------------------------------------------ #
 
     def _build_font_cache(self):
@@ -476,6 +492,36 @@ class EPaperDisplay:
         elapsed = time.monotonic() - self.last_refresh_time
         return elapsed >= self.min_refresh_interval
 
+    def _must_do_full_refresh(self):
+        """
+        Return True when a partial refresh would be unsafe or undesirable.
+
+        Cases:
+        - partial refresh limit reached
+        - no valid partial base image has been seeded yet
+        """
+        return (
+            self.partial_refresh_count >= self._partial_refresh_limit
+            or not self._partial_base_ready
+        )
+
+    def _do_full_refresh(self, buffer):
+        """
+        Perform one full refresh and seed the panel for later partial updates.
+
+        On the Waveshare 2.13" V3 driver, displayPartBaseImage() writes the
+        same image into both internal RAM buffers. That is important because
+        later partial refreshes compare against the old image state. If only a
+        normal full display is used, the first partial update can look smeared
+        or badly ghosted.
+        """
+        if hasattr(self.epd, "displayPartBaseImage"):
+            self.epd.displayPartBaseImage(buffer)
+        else:
+            self.epd.display(buffer)
+
+        self._partial_base_ready = True
+
     def _ensure_awake(self):
         """
         Make sure the display is ready to receive a new image.
@@ -489,9 +535,11 @@ class EPaperDisplay:
             self.initialized           = True
             self.sleeping              = False
             self.partial_refresh_count = self._partial_refresh_limit
+            self._partial_base_ready   = False
             return
 
         if self.sleeping:
             self.epd.init()
             self.sleeping              = False
             self.partial_refresh_count = self._partial_refresh_limit
+            self._partial_base_ready   = False
