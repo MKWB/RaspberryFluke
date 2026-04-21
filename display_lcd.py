@@ -27,25 +27,30 @@ from waveshare_lcd import LCD_1in44
 from parse_utils import shorten_interface_name
 
 
+# Index of the PORT line within the 5 body lines passed to show_lines.
+# SW=0, IP=1, PORT=2, VLAN=3, VOICE=4
+_PORT_LINE_INDEX = 2
+
+
 class LCDDisplay:
     # Screen size in pixels for the Waveshare 1.44" LCD HAT.
-    DISPLAY_WIDTH = 128
+    DISPLAY_WIDTH  = 128
     DISPLAY_HEIGHT = 128
 
     # Text position on the screen.
     LEFT_MARGIN = 4
-    TOP_MARGIN = 4
+    TOP_MARGIN  = 4
 
     # Font sizing rules.
     BASE_FONT_SIZE = 14
-    MIN_FONT_SIZE = 8
-    LINE_SPACING = 2
+    MIN_FONT_SIZE  = 8
+    LINE_SPACING   = 2
 
     # Default font file.
     DEFAULT_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
     # Basic colors for a small LCD UI.
-    DEFAULT_BG_COLOR = (0, 0, 0)
+    DEFAULT_BG_COLOR   = (0, 0, 0)
     DEFAULT_TEXT_COLOR = (255, 255, 255)
 
     # Backlight brightness percent.
@@ -81,18 +86,17 @@ class LCDDisplay:
         backlight_brightness:
             Brightness percent from 0 to 100.
         """
-        self.font_path = font_path or self.DEFAULT_FONT_PATH
-        self.rotate_180 = rotate_180
-        self.clear_on_start = clear_on_start
-
-        self.background_color = background_color or self.DEFAULT_BG_COLOR
-        self.text_color = text_color or self.DEFAULT_TEXT_COLOR
+        self.font_path          = font_path or self.DEFAULT_FONT_PATH
+        self.rotate_180         = rotate_180
+        self.clear_on_start     = clear_on_start
+        self.background_color   = background_color or self.DEFAULT_BG_COLOR
+        self.text_color         = text_color or self.DEFAULT_TEXT_COLOR
         self.backlight_brightness = max(0, min(100, int(backlight_brightness)))
 
         self.lock = threading.RLock()
 
         # Track display state.
-        self.initialized = False
+        self.initialized  = False
         self.backlight_on = False
 
         # Save the last 5 lines shown on screen.
@@ -108,10 +112,9 @@ class LCDDisplay:
         """
         Preload the font sizes used by the LCD.
 
-        If the font file cannot be loaded, fall back to PIL's default font.
+        Falls back to PIL's default font if the font file cannot be loaded.
         """
         cache = {}
-
         try:
             for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
                 cache[size] = ImageFont.truetype(self.font_path, size)
@@ -119,7 +122,6 @@ class LCDDisplay:
             default_font = ImageFont.load_default()
             for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
                 cache[size] = default_font
-
         return cache
 
     def initialize(self):
@@ -168,8 +170,6 @@ class LCDDisplay:
             )
 
             self._show_image(image)
-
-            # Remember that the screen is now blank.
             self.last_lines = ["", "", "", "", ""]
 
     def show_lines(self, lines, force=False):
@@ -177,7 +177,7 @@ class LCDDisplay:
         Show text on the LCD display.
 
         lines:
-            A list of text lines to show on the screen.
+            A list of up to 5 text lines to show on the screen.
 
         force:
             If True, redraw even if the text did not change.
@@ -190,10 +190,8 @@ class LCDDisplay:
             self._ensure_initialized()
 
             normalized_lines = self._normalize_lines(lines)
-            prepared_lines = self._prepare_lines_for_lcd(normalized_lines)
+            prepared_lines   = self._prepare_lines_for_lcd(normalized_lines)
 
-            # LCDs do not need e-paper-style refresh throttling.
-            # If the text is exactly the same and force is False, skip redraw.
             if not force and prepared_lines == self.last_lines:
                 return False
 
@@ -201,8 +199,6 @@ class LCDDisplay:
             self._show_image(image)
 
             self.last_lines = prepared_lines
-
-            # Keep the backlight on during normal operation.
             self._set_backlight(True)
 
             return True
@@ -211,11 +207,9 @@ class LCDDisplay:
         """
         Optional low-activity display state.
 
-        For this LCD version, normal operation keeps the backlight on
-        continuously so the user can always see the screen.
-
-        This method intentionally does nothing right now so the rest
-        of the project can still call a display 'sleep' method if needed.
+        LCDs do not require an explicit sleep mode the way e-paper does.
+        This method is intentionally a no-op so the rest of the project
+        can call display.sleep() without needing to know the display type.
 
         Returns:
             False to indicate no state change was made.
@@ -250,11 +244,6 @@ class LCDDisplay:
 
         backlight_off:
             If True, turn the backlight off.
-
-        Important:
-            This only works if your program exits cleanly and this method
-            actually gets called. If power is physically pulled, Python
-            does not get a chance to run this cleanup code.
         """
         with self.lock:
             if not self.initialized:
@@ -271,14 +260,12 @@ class LCDDisplay:
             except Exception:
                 pass
 
-            self.initialized = False
+            self.initialized  = False
             self.backlight_on = False
 
     def force_refresh(self):
         """
         Redraw the current screen contents again.
-
-        This redraws the same text on purpose.
 
         Returns:
             True if the display was redrawn.
@@ -287,7 +274,6 @@ class LCDDisplay:
         with self.lock:
             if self.last_lines is None:
                 return False
-
             return self.show_lines(self.last_lines, force=True)
 
     def get_status(self):
@@ -297,10 +283,10 @@ class LCDDisplay:
         """
         with self.lock:
             return {
-                "initialized": self.initialized,
-                "backlight_on": self.backlight_on,
-                "last_lines": self.last_lines,
-                "rotate_180": self.rotate_180,
+                "initialized":          self.initialized,
+                "backlight_on":         self.backlight_on,
+                "last_lines":           self.last_lines,
+                "rotate_180":           self.rotate_180,
                 "backlight_brightness": self.backlight_brightness,
             }
 
@@ -314,19 +300,12 @@ class LCDDisplay:
             self.background_color,
         )
         draw = ImageDraw.Draw(image)
-
         font = self._choose_font(draw, lines)
-        y = self.TOP_MARGIN
+        y    = self.TOP_MARGIN
 
         for line in lines:
-            draw.text(
-                (self.LEFT_MARGIN, y),
-                line,
-                font=font,
-                fill=self.text_color,
-            )
-
-            bbox = draw.textbbox((0, 0), line, font=font)
+            draw.text((self.LEFT_MARGIN, y), line, font=font, fill=self.text_color)
+            bbox        = draw.textbbox((0, 0), line, font=font)
             line_height = bbox[3] - bbox[1]
             y += line_height + self.LINE_SPACING
 
@@ -338,9 +317,6 @@ class LCDDisplay:
     def _show_image(self, image):
         """
         Send a PIL image to the LCD.
-
-        Waveshare's LCD_ShowImage method expects an image matching
-        the display dimensions.
         """
         self._ensure_initialized()
         self.lcd.LCD_ShowImage(image, 0, 0)
@@ -349,98 +325,100 @@ class LCDDisplay:
         """
         Clean up the lines before drawing them.
 
-        What this does:
         - Keep only the first 5 lines
         - Turn None into blank text
-        - Remove extra spaces
-        - Add blank lines if fewer than 5 were provided
+        - Collapse extra whitespace
+        - Pad with blank lines if fewer than 5 were provided
         """
         cleaned = []
-
         for line in list(lines)[:max_lines]:
             if line is None:
                 cleaned.append("")
             else:
                 cleaned.append(" ".join(str(line).strip().split()))
-
         while len(cleaned) < max_lines:
             cleaned.append("")
-
         return cleaned
 
     def _prepare_lines_for_lcd(self, lines):
         """
-        Make the lines more likely to fit on the small 128x128 LCD.
+        Adapt lines for the small 128x128 LCD screen.
 
-        This helper keeps the display logic local to the LCD module.
-        It does not parse protocols or decide what values mean.
+        Interface name shortening is applied only to the PORT line (index 2)
+        because that is the only line that can contain long Cisco-style names
+        like GigabitEthernet1/0/24. Applying it to other lines (SW name, IP,
+        VLAN) would corrupt unrelated text.
+
+        All lines are then truncated with "..." if they exceed the usable
+        width at the minimum font size.
         """
         draw = ImageDraw.Draw(
             Image.new("RGB", (self.DISPLAY_WIDTH, self.DISPLAY_HEIGHT), self.background_color)
         )
-        font = self._get_font(self.MIN_FONT_SIZE)
+        font        = self._get_font(self.MIN_FONT_SIZE)
         usable_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
 
         prepared = []
 
-        for line in lines:
-            shortened = shorten_interface_name(line)
-            shortened = self._truncate_to_width(draw, shortened, font, usable_width)
-            prepared.append(shortened)
+        for index, line in enumerate(lines):
+            # Only shorten interface names on the PORT line.
+            if index == _PORT_LINE_INDEX:
+                processed = shorten_interface_name(line)
+            else:
+                processed = line
+
+            processed = self._truncate_to_width(draw, processed, font, usable_width)
+            prepared.append(processed)
 
         return prepared
 
     def _truncate_to_width(self, draw, text, font, usable_width):
         """
-        Truncate a line with ... if it is too wide at the minimum font size.
+        Truncate a line with "..." if it is too wide at the minimum font size.
         """
         if not text:
             return text
 
-        bbox = draw.textbbox((0, 0), text, font=font)
+        bbox       = draw.textbbox((0, 0), text, font=font)
         text_width = bbox[2] - bbox[0]
 
         if text_width <= usable_width:
             return text
 
         ellipsis = "..."
-        trimmed = text
+        trimmed  = text
 
         while trimmed:
-            trimmed = trimmed[:-1].rstrip()
+            trimmed   = trimmed[:-1].rstrip()
             candidate = trimmed + ellipsis
-            bbox = draw.textbbox((0, 0), candidate, font=font)
-            candidate_width = bbox[2] - bbox[0]
+            bbox      = draw.textbbox((0, 0), candidate, font=font)
 
-            if candidate_width <= usable_width:
+            if bbox[2] - bbox[0] <= usable_width:
                 return candidate
 
         return ellipsis
 
     def _choose_font(self, draw, lines):
         """
-        Pick the biggest font size that still fits on the screen.
+        Pick the biggest font size where all lines fit on the screen.
         """
         for size in range(self.BASE_FONT_SIZE, self.MIN_FONT_SIZE - 1, -1):
             font = self._get_font(size)
-
             if self._lines_fit(draw, lines, font):
                 return font
-
         return self._get_font(self.MIN_FONT_SIZE)
 
     def _lines_fit(self, draw, lines, font):
         """
-        Check if all lines fit on the screen.
+        Check if all lines fit on the screen at the given font size.
         """
-        usable_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
+        usable_width  = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
         usable_height = self.DISPLAY_HEIGHT - self.TOP_MARGIN
-
-        total_height = 0
+        total_height  = 0
 
         for index, line in enumerate(lines):
-            bbox = draw.textbbox((0, 0), line, font=font)
-            text_width = bbox[2] - bbox[0]
+            bbox        = draw.textbbox((0, 0), line, font=font)
+            text_width  = bbox[2] - bbox[0]
             text_height = bbox[3] - bbox[1]
 
             if text_width > usable_width:
@@ -455,10 +433,7 @@ class LCDDisplay:
 
     def _get_font(self, size):
         """
-        Return a cached font object for the requested size.
-
-        If the requested size is outside the configured range,
-        clamp it to the nearest valid size.
+        Return a cached font for the requested size, clamped to the valid range.
         """
         size = max(self.MIN_FONT_SIZE, min(self.BASE_FONT_SIZE, int(size)))
         return self.font_cache[size]
@@ -478,7 +453,7 @@ class LCDDisplay:
 
     def _ensure_initialized(self):
         """
-        Make sure the display is ready to use.
+        Raise if the display has not been initialized yet.
         """
         if not self.initialized:
             raise RuntimeError(

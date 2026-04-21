@@ -141,6 +141,7 @@ sudo chown -R root:root /opt/raspberryfluke
 
 9. Install the drivers for the Waveshare screen you are using:
 
+
     Waveshare 2.13" E-Paper HAT+ display:
 
         ```bash
@@ -156,7 +157,6 @@ sudo chown -R root:root /opt/raspberryfluke
     OR
 
     Waveshare 1.44inch LCD display HAT:
-
 
         Install the archive extractor if needed:
 

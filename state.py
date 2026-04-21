@@ -1,122 +1,213 @@
 """
-state.py
+capture.py
 
-This file stores RaspberryFluke runtime state in memory.
+This module is responsible for collecting raw neighbor-discovery data from
+lldpd / lldpctl.
 
-What this file does:
-- Keep track of the current neighbor data
-- Keep track of the last text shown on the display
-- Keep track of the last successful discovery time
+What this file should do:
+- Run lldpctl
+- Return the raw command output as text
+- Keep subprocess handling in one place
+- Fail cleanly if no neighbor data is available yet
 
-What this file does NOT do:
-- Capture LLDP or CDP data
-- Parse raw protocol output
-- Initialize or control the display hardware
-- Write runtime state to disk
+What this file should NOT do:
+- Parse LLDP fields
+- Parse CDP fields
+- Update application state
+- Talk directly to the display
 
-Why this file exists:
-- It gives main.py one clean place to store and read runtime values
-- It keeps the main loop from becoming cluttered with loose variables
-- It keeps RaspberryFluke state in RAM only, which is good for SD card life
+That work belongs in other modules.
 """
 
+from __future__ import annotations
 
-class RaspberryFlukeState:
+import logging
+import subprocess
+from typing import Optional
+
+
+log = logging.getLogger(__name__)
+
+# Timeout used during normal steady-state polling.
+_DEFAULT_TIMEOUT: float = 5.0
+
+# Shorter timeout used during startup so early boot polling stays responsive.
+# Set to 2.0 seconds to give lldpd enough time to respond on a cold Pi boot
+# while still allowing fast retry cycles.
+_STARTUP_TIMEOUT: float = 2.0
+
+
+def _build_lldpctl_command(
+    interface: Optional[str] = None,
+    output_format: str = "keyvalue",
+) -> list[str]:
     """
-    In-memory state container for RaspberryFluke.
+    Build the lldpctl command as a list so it can be passed safely to subprocess.
 
-    This class acts as the program's short-term memory while it is running.
+    Parameters:
+        interface:
+            Optional interface name such as "eth0".
+            If provided, lldpctl will be limited to that interface.
 
-    Main ideas:
-    - current_neighbor: the most recent parsed neighbor data
-    - last_display_text: the last text block sent to the display
-    - last_success_time: the last time discovery/parsing succeeded
+        output_format:
+            The lldpctl output format to request.
+            "keyvalue" is the most useful for machine parsing.
+
+    Returns:
+        A subprocess-ready command list.
     """
+    command = ["lldpctl"]
 
-    def __init__(self) -> None:
-        """
-        Create a new empty state object.
+    if output_format:
+        command.extend(["-f", output_format])
 
-        At startup, the program does not yet know anything about the switch
-        or port it is connected to, so all runtime values begin empty.
-        """
-        # The newest parsed neighbor data currently in memory.
-        self.current_neighbor = None
+    if interface:
+        command.append(interface)
 
-        # The last text block that was sent to the display.
-        # This helps prevent unnecessary display refreshes.
-        self.last_display_text = ""
+    return command
 
-        # The last time the app successfully captured and parsed valid data.
-        # Stored as a float timestamp from time.monotonic() or similar.
-        self.last_success_time = 0.0
 
-    def update_neighbor(self, neighbor: dict) -> None:
-        """
-        Save new valid neighbor data into state.
+def _choose_timeout(
+    timeout: Optional[float] = None,
+    startup_mode: bool = False,
+) -> float:
+    """
+    Choose the timeout value used for the lldpctl command.
 
-        This method assumes the provided neighbor data is already valid
-        and already normalized by the parser layer.
-        """
-        self.current_neighbor = dict(neighbor)
+    Parameters:
+        timeout:
+            Optional explicit timeout value in seconds.
+            If provided, it wins over the defaults.
 
-    def clear_neighbor(self) -> None:
-        """
-        Clear the active neighbor data from memory.
-        """
-        self.current_neighbor = None
+        startup_mode:
+            If True, use the shorter startup timeout.
 
-    def has_neighbor(self) -> bool:
-        """
-        Return True if there is active current neighbor data.
-        """
-        return self.current_neighbor is not None
+    Returns:
+        Timeout as a float, always at least 1.0 second.
+    """
+    if timeout is not None:
+        try:
+            return max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            pass
 
-    def set_display_text(self, text: str) -> None:
-        """
-        Save the last text block that was sent to the display.
+    if startup_mode:
+        return _STARTUP_TIMEOUT
 
-        This is used so main.py can compare the new text with the old text
-        and avoid unnecessary display updates.
-        """
-        self.last_display_text = text
+    return _DEFAULT_TIMEOUT
 
-    def clear_display_text(self) -> None:
-        """
-        Clear the saved display text.
-        """
-        self.last_display_text = ""
 
-    def set_last_success_time(self, timestamp_value: float) -> None:
-        """
-        Save the time of the last successful capture/parse cycle.
-        """
-        self.last_success_time = float(timestamp_value)
+def _run_command(
+    command: list[str],
+    timeout: float,
+) -> str:
+    """
+    Run a system command and return stdout as a string.
 
-    def reset(self) -> None:
-        """
-        Reset the entire runtime state back to startup defaults.
+    Parameters:
+        command:
+            Command list to execute.
 
-        Use this only when you truly want a full in-memory reset.
-        """
-        self.current_neighbor = None
-        self.last_display_text = ""
-        self.last_success_time = 0.0
+        timeout:
+            Maximum number of seconds to wait before aborting.
 
-    def neighbor_changed(self, new_neighbor: dict) -> bool:
-        """
-        Return True if the provided neighbor data is different from
-        the current active neighbor data.
+    Returns:
+        The command stdout as a stripped string.
+        Returns an empty string on timeout or command failure.
 
-        This is a simple full-dictionary comparison.
-        That is usually enough for RaspberryFluke because the neighbor
-        records are small and predictable.
-        """
-        return self.current_neighbor != new_neighbor
+    Notes:
+        - stderr is captured so it can be logged when useful.
+        - Non-zero exit status does not automatically mean a crash.
+          lldpctl may return non-zero when neighbor data is not ready yet.
+    """
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log.debug(
+            "Command timed out after %.1f second(s): %s",
+            timeout,
+            " ".join(command),
+        )
+        return ""
+    except FileNotFoundError:
+        log.error("Command not found: %s", command[0])
+        return ""
+    except Exception as exc:
+        log.exception(
+            "Unexpected error while running command %s: %s",
+            " ".join(command),
+            exc,
+        )
+        return ""
 
-    def display_text_changed(self, new_text: str) -> bool:
-        """
-        Return True if the provided text is different from the last
-        text that was shown on the display.
-        """
-        return self.last_display_text != new_text
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+
+    if result.returncode != 0:
+        if stderr:
+            log.debug(
+                "Command returned non-zero exit status %s: %s | stderr=%s",
+                result.returncode,
+                " ".join(command),
+                stderr,
+            )
+        else:
+            log.debug(
+                "Command returned non-zero exit status %s: %s",
+                result.returncode,
+                " ".join(command),
+            )
+
+    return stdout
+
+
+def capture_neighbors(
+    interface: Optional[str] = None,
+    timeout: Optional[float] = None,
+    startup_mode: bool = False,
+) -> str:
+    """
+    Capture raw neighbor data using lldpctl in keyvalue format.
+
+    This is the only public function in this module. main.py should call
+    this and pass the raw text to parse_utils.parse_keyvalue_output.
+
+    Parameters:
+        interface:
+            Optional interface name such as "eth0".
+
+        timeout:
+            Optional explicit timeout in seconds (float).
+            If not provided, a sensible default is chosen automatically.
+
+        startup_mode:
+            If True, use a shorter timeout so boot-time polling can retry more
+            quickly and reduce time-to-info.
+
+    Returns:
+        Raw lldpctl output as text.
+        Returns an empty string if nothing useful is available.
+    """
+    selected_timeout = _choose_timeout(timeout=timeout, startup_mode=startup_mode)
+    command = _build_lldpctl_command(interface=interface, output_format="keyvalue")
+    raw_output = _run_command(command, timeout=selected_timeout)
+
+    if raw_output:
+        log.debug(
+            "Captured %d characters of lldpctl keyvalue output",
+            len(raw_output),
+        )
+    else:
+        log.debug(
+            "No lldpctl keyvalue output captured (startup_mode=%s, timeout=%.1f)",
+            startup_mode,
+            selected_timeout,
+        )
+
+    return raw_output

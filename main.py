@@ -4,21 +4,23 @@ main.py
 Main entry point for RaspberryFluke.
 
 What this file does:
-- Load configuration values from rfconfig.py
+- Load configuration from rfconfig.py
 - Set up logging
+- Validate startup configuration
 - Create the selected display backend
 - Create the in-memory runtime state
-- Capture raw neighbor data from lldpctl
-- Parse that raw data into one normalized neighbor record
-- Update the display only when visible text changes
-- Keep runtime state in memory only
+- Send an LLDP trigger frame on link-up to prompt an immediate switch response
+- Capture raw LLDP and CDP frames directly from the wire
+- Parse frames immediately as they arrive
+- Update the display when content changes
 - Handle graceful shutdown
 
 What this file does NOT do:
 - Implement e-paper refresh timing policy
 - Implement LCD-specific drawing rules
-- Parse raw keyvalue fields itself
+- Parse raw frame bytes itself
 - Write runtime state to disk
+- Call lldpctl or depend on lldpd
 """
 
 from __future__ import annotations
@@ -26,156 +28,154 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
 
-import capture
-import parse_cdp
-import parse_lldp
+import capture_raw
+import parse_cdp_raw
+import parse_lldp_raw
 import rfconfig
+import trigger
 
 from state import RaspberryFlukeState
 
 
-STOP_REQUESTED = False
 log = logging.getLogger(__name__)
 
+# Shutdown event. Set by the signal handler to stop the main loop cleanly.
+_stop_event = threading.Event()
+
+# Error backoff settings for the main loop.
+_MAX_CONSECUTIVE_ERRORS = 5
+_BASE_BACKOFF_SECONDS   = 5.0
+_MAX_BACKOFF_SECONDS    = 60.0
+
+
+# ============================================================
+# -------------------- SETUP ---------------------------------
+# ============================================================
 
 def setup_logging() -> None:
     """
     Configure logging from rfconfig.py.
 
-    Intended behavior:
-    - appliance mode defaults to WARNING
-    - dev mode defaults to INFO
-    - LOG_LEVEL can override, but invalid values fall back safely
+    LOG_LEVEL controls verbosity.
+    "WARNING" minimizes SD card writes during normal appliance operation.
+    "INFO" or "DEBUG" are useful when troubleshooting.
     """
-    app_mode = str(getattr(rfconfig, "APP_MODE", "appliance")).strip().lower()
-    configured_level_name = str(getattr(rfconfig, "LOG_LEVEL", "")).strip().upper()
+    configured_level_name = str(
+        getattr(rfconfig, "LOG_LEVEL", "WARNING")
+    ).strip().upper()
 
-    if app_mode == "dev":
-        default_level = logging.INFO
-    else:
-        default_level = logging.WARNING
+    valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
-    if configured_level_name and hasattr(logging, configured_level_name):
-        selected_level = getattr(logging, configured_level_name)
-    else:
-        selected_level = default_level
+    if configured_level_name not in valid_levels:
+        configured_level_name = "WARNING"
+
+    selected_level = getattr(logging, configured_level_name, logging.WARNING)
 
     logging.basicConfig(
         level=selected_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    log.info("Logging initialized")
-    log.info("APP_MODE=%s", app_mode)
-    log.info("LOG_LEVEL=%s", logging.getLevelName(selected_level))
+    log.info("Logging initialized at level %s", configured_level_name)
 
 
-def handle_shutdown_signal(signum: int, _frame: Any) -> None:
+def handle_shutdown_signal(signum: int, _frame: object) -> None:
     """
-    Mark the application for clean shutdown.
-    """
-    global STOP_REQUESTED
+    Set the shutdown event when SIGTERM or SIGINT is received.
 
+    Setting _stop_event wakes any select() or event.wait() call in the
+    main loop so shutdown happens within seconds rather than waiting
+    for the next receive timeout.
+    """
     try:
         signal_name = signal.Signals(signum).name
     except Exception:
         signal_name = str(signum)
 
     log.info("Shutdown signal received: %s", signal_name)
-    STOP_REQUESTED = True
+    _stop_event.set()
 
+
+# ============================================================
+# -------------------- CONFIG HELPERS ------------------------
+# ============================================================
 
 def get_display_type() -> str:
-    """
-    Return the configured display type, or 'epaper' if invalid.
-    """
     display_type = str(getattr(rfconfig, "DISPLAY_TYPE", "epaper")).strip().lower()
 
     if display_type not in ("epaper", "lcd"):
-        log.warning("Invalid DISPLAY_TYPE '%s'. Falling back to 'epaper'.", display_type)
+        log.warning(
+            "Invalid DISPLAY_TYPE '%s' in rfconfig.py. Falling back to 'epaper'.",
+            display_type,
+        )
         return "epaper"
 
     return display_type
 
 
 def get_network_interface() -> str:
-    """
-    Return the configured network interface.
-    """
     interface = str(getattr(rfconfig, "NETWORK_INTERFACE", "eth0")).strip()
     return interface or "eth0"
 
 
-def get_startup_poll_interval() -> float:
-    """
-    Return the fast poll interval used during startup before the first
-    successful neighbor discovery.
-    """
+def get_raw_receive_timeout() -> float:
     try:
-        value = float(getattr(rfconfig, "STARTUP_POLL_INTERVAL", 1))
+        value = float(getattr(rfconfig, "RAW_RECEIVE_TIMEOUT", 2.0))
     except (TypeError, ValueError):
-        value = 1.0
-
-    return max(0.25, value)
-
-
-def get_steady_poll_interval() -> float:
-    """
-    Return the normal poll interval used after the first successful
-    neighbor discovery.
-    """
-    try:
-        value = float(getattr(rfconfig, "STEADY_POLL_INTERVAL", 10))
-    except (TypeError, ValueError):
-        value = 10.0
-
+        value = 2.0
     return max(0.5, value)
 
 
 def get_discovery_timeout() -> float:
-    """
-    Return how long active neighbor state can remain valid without a
-    successful parse before it is considered stale.
-    """
     try:
         value = float(getattr(rfconfig, "DISCOVERY_TIMEOUT", 180))
     except (TypeError, ValueError):
         value = 180.0
-
-    return max(1.0, value)
-
-
-def get_capture_timeout() -> float:
-    """
-    Return the normal lldpctl command timeout in seconds.
-    """
-    try:
-        value = float(getattr(rfconfig, "CAPTURE_TIMEOUT", 2))
-    except (TypeError, ValueError):
-        value = 2.0
-
     return max(1.0, value)
 
 
 def should_show_waiting_for_link_screen() -> bool:
-    """
-    Return True if the app should show a dedicated waiting-for-link screen.
-    """
     return bool(getattr(rfconfig, "WAITING_FOR_LINK_SCREEN", True))
 
 
 def should_show_waiting_for_discovery_screen() -> bool:
-    """
-    Return True if the app should show a dedicated waiting-for-discovery screen.
-    """
     return bool(getattr(rfconfig, "WAITING_FOR_DISCOVERY_SCREEN", True))
 
 
-def create_display() -> Any:
+# ============================================================
+# -------------------- STARTUP VALIDATION --------------------
+# ============================================================
+
+def validate_startup_config(interface: str) -> None:
+    """
+    Check that the configured network interface exists on this system.
+
+    Logs a warning if not found so the operator knows immediately
+    rather than seeing mysterious empty output during operation.
+    The main loop is not aborted — carrier detection handles
+    missing interfaces gracefully.
+    """
+    net_path = Path("/sys/class/net") / interface
+
+    if not net_path.exists():
+        log.warning(
+            "Network interface '%s' was not found in /sys/class/net. "
+            "Check NETWORK_INTERFACE in rfconfig.py.",
+            interface,
+        )
+    else:
+        log.info("Network interface '%s' found.", interface)
+
+
+# ============================================================
+# -------------------- DISPLAY CREATION ----------------------
+# ============================================================
+
+def create_display() -> object:
     """
     Create the selected display backend.
     """
@@ -201,65 +201,75 @@ def create_display() -> Any:
         font_path=getattr(rfconfig, "DISPLAY_FONT_PATH", None),
         min_refresh_interval=getattr(rfconfig, "EPAPER_MIN_REFRESH_INTERVAL", 10),
         auto_sleep=getattr(rfconfig, "EPAPER_AUTO_SLEEP", True),
+        partial_refresh_limit=getattr(rfconfig, "EPAPER_PARTIAL_REFRESH_LIMIT", 8),
         startup_mode=True,
     )
 
 
-def initialize_display(display: Any) -> None:
-    """
-    Initialize the selected display.
-
-    E-paper initialize() now defaults to not clearing on startup, which is what
-    we want for faster appliance behavior. LCD initialize() still works with no
-    arguments as well.
-    """
+def initialize_display(display: object) -> None:
     display.initialize()
 
 
-def shutdown_display(display: Any) -> None:
-    """
-    Shut the selected display down cleanly.
-    """
+def shutdown_display(display: object) -> None:
     try:
         display.shutdown()
     except Exception:
         log.exception("Display shutdown failed")
 
 
-def disable_display_startup_mode(display: Any) -> None:
+def disable_display_startup_mode(display: object) -> None:
     """
-    Disable startup mode on display backends that support it.
+    Disable startup mode after the first real neighbor is shown.
 
-    This is mainly for the e-paper display so it can return to normal
-    sleep-friendly behavior after the first real neighbor result is shown.
+    The e-paper display can then sleep between updates as normal
+    instead of staying awake for fast early-boot screen changes.
     """
     if not hasattr(display, "set_startup_mode"):
         return
-
     try:
         display.set_startup_mode(False)
     except Exception:
         log.exception("Failed to disable display startup mode")
 
 
-def first_non_empty(*values: Any, default: str = "") -> str:
+def enable_display_startup_mode(display: object) -> None:
+    """
+    Re-enable startup mode when a neighbor goes stale.
+
+    Returns the display to fast-update behavior while waiting
+    for the next port connection.
+    """
+    if not hasattr(display, "set_startup_mode"):
+        return
+    try:
+        display.set_startup_mode(True)
+    except Exception:
+        log.exception("Failed to re-enable display startup mode")
+
+
+# ============================================================
+# -------------------- PARSING -------------------------------
+# ============================================================
+
+def first_non_empty(*values: object, default: str = "") -> str:
     """
     Return the first non-empty value as a stripped string.
     """
     for value in values:
         if value is None:
             continue
-
         text = str(value).strip()
         if text:
             return text
-
     return default
 
 
 def parser_result_has_useful_data(parsed: dict[str, str]) -> bool:
     """
     Return True if the parser result contains at least one useful field.
+
+    Used as a sanity check to avoid displaying a completely empty record
+    in the rare case where a frame was captured but parsing yielded nothing.
     """
     if not parsed:
         return False
@@ -270,200 +280,117 @@ def parser_result_has_useful_data(parsed: dict[str, str]) -> bool:
     )
 
 
-def parser_result_score(parsed: dict[str, str]) -> int:
-    """
-    Return a simple usefulness score for a parsed neighbor record.
-
-    This helps when both parsers found something useful but neither provided
-    a high-confidence protocol signal.
-    """
-    if not parsed:
-        return 0
-
-    return sum(
-        1
-        for key in ("switch_name", "switch_ip", "port", "vlan", "voice_vlan")
-        if str(parsed.get(key, "")).strip()
-    )
-
-
 def normalize_neighbor_record(parsed: dict[str, str], protocol: str) -> dict[str, str]:
     """
-    Convert parser output into one consistent schema.
+    Convert parser output into one consistent schema for main.py and state.py.
     """
     return {
         "switch_name": first_non_empty(parsed.get("switch_name"), default="Unknown"),
-        "switch_ip": first_non_empty(parsed.get("switch_ip"), default="Unknown"),
-        "port": first_non_empty(parsed.get("port"), default="Unknown"),
-        "vlan": first_non_empty(parsed.get("vlan"), default="Unknown"),
-        "voice_vlan": first_non_empty(parsed.get("voice_vlan"), default="None"),
-        "protocol": protocol,
+        "switch_ip":   first_non_empty(parsed.get("switch_ip"),   default="Unknown"),
+        "port":        first_non_empty(parsed.get("port"),        default="Unknown"),
+        "vlan":        first_non_empty(parsed.get("vlan"),        default="Unknown"),
+        "voice_vlan":  first_non_empty(parsed.get("voice_vlan"),  default="None"),
+        "protocol":    protocol,
     }
 
 
-def parse_neighbor_data(raw_data: str, interface: str) -> dict[str, str] | None:
+def parse_neighbor_data(
+    protocol: str,
+    frame: bytes,
+) -> dict[str, str] | None:
     """
-    Parse raw lldpctl keyvalue output into one normalized neighbor record.
+    Parse a raw frame into a normalized neighbor record.
 
-    Protocol decision rules:
-    - Parse both CDP and LLDP from the same raw data.
-    - If CDP is high-confidence, use CDP.
-    - Else if LLDP is high-confidence, use LLDP.
-    - Else if both produced useful but unconfirmed data, choose the richer
-      result and label it UNKNOWN.
-    - Return None if neither parser found anything useful.
+    Because capture_raw.py identifies the frame type before returning it,
+    we know exactly which parser to call. There is no dual-parse or
+    protocol confidence scoring — the raw socket tells us the answer.
 
-    This avoids falsely labeling generic normalized neighbor data as CDP.
+    Parameters:
+        protocol : "lldp" or "cdp" as returned by RawCapture.receive_frame()
+        frame    : raw Ethernet frame bytes
+
+    Returns a normalized neighbor dict, or None if parsing yielded no
+    useful data (malformed frame, unexpected format, etc.)
     """
-    if not raw_data:
+    if protocol == "lldp":
+        parsed = parse_lldp_raw.parse_lldp_frame(frame)
+        label  = "LLDP"
+    elif protocol == "cdp":
+        parsed = parse_cdp_raw.parse_cdp_frame(frame)
+        label  = "CDP"
+    else:
+        log.debug("Unknown protocol '%s' — skipping frame", protocol)
         return None
 
-    cdp_result = parse_cdp.parse_cdp_data(raw_data, interface=interface)
-    lldp_result = parse_lldp.parse_lldp_data(raw_data, interface=interface)
+    if not parser_result_has_useful_data(parsed):
+        log.debug("Parser returned no useful data for %s frame", protocol.upper())
+        return None
 
-    cdp_has_useful = parser_result_has_useful_data(cdp_result)
-    lldp_has_useful = parser_result_has_useful_data(lldp_result)
+    return normalize_neighbor_record(parsed, protocol=label)
 
-    cdp_is_confident = str(cdp_result.get("source", "")).strip().upper() == "CDP"
-    lldp_is_confident = str(lldp_result.get("source", "")).strip().upper() == "LLDP"
 
-    if cdp_is_confident:
-        return normalize_neighbor_record(cdp_result, protocol="CDP")
-
-    if lldp_is_confident:
-        return normalize_neighbor_record(lldp_result, protocol="LLDP")
-
-    if cdp_has_useful and lldp_has_useful:
-        cdp_score = parser_result_score(cdp_result)
-        lldp_score = parser_result_score(lldp_result)
-
-        if cdp_score > lldp_score:
-            return normalize_neighbor_record(cdp_result, protocol="UNKNOWN")
-
-        return normalize_neighbor_record(lldp_result, protocol="UNKNOWN")
-
-    if lldp_has_useful:
-        return normalize_neighbor_record(lldp_result, protocol="UNKNOWN")
-
-    if cdp_has_useful:
-        return normalize_neighbor_record(cdp_result, protocol="UNKNOWN")
-
-    return None
-
+# ============================================================
+# -------------------- DISPLAY CONTENT -----------------------
+# ============================================================
 
 def build_display_lines(neighbor: dict[str, str]) -> list[str]:
     """
-    Build the exact 5 lines shown on screen.
+    Build the 5 body lines shown below the RaspberryFluke header.
     """
     return [
-        f"SW: {neighbor['switch_name']}",
-        f"IP: {neighbor['switch_ip']}",
-        f"PORT: {neighbor['port']}",
-        f"VLAN: {neighbor['vlan']}",
-        f"VOICE: {neighbor['voice_vlan']}",
+        f"SW: {neighbor.get('switch_name', 'Unknown')}",
+        f"IP: {neighbor.get('switch_ip',   'Unknown')}",
+        f"PORT: {neighbor.get('port',      'Unknown')}",
+        f"VLAN: {neighbor.get('vlan',      'Unknown')}",
+        f"VOICE: {neighbor.get('voice_vlan', 'None')}",
     ]
-
-
-def build_display_text(lines: list[str]) -> str:
-    """
-    Join the display lines into one text block for state comparison.
-    """
-    return "\n".join(lines)
 
 
 def build_startup_lines() -> list[str]:
-    """
-    Build the startup screen.
-    """
-    return [
-        "RaspberryFluke",
-        "",
-        "Booting...",
-        "Listening for",
-        "LLDP/CDP...",
-    ]
+    return ["", "Booting...", "Listening for", "LLDP/CDP...", ""]
 
 
 def build_waiting_for_link_lines(interface: str) -> list[str]:
-    """
-    Build the screen shown when the Ethernet link is not up yet.
-    """
-    return [
-        "RaspberryFluke",
-        "",
-        "Waiting for",
-        f"link on {interface}",
-        "...",
-    ]
+    return ["", "Waiting for", f"link on {interface}", "...", ""]
 
 
 def build_waiting_for_discovery_lines() -> list[str]:
-    """
-    Build the screen shown when link is up but no LLDP/CDP data is ready yet.
-    """
-    return [
-        "RaspberryFluke",
-        "",
-        "Link up",
-        "Waiting for",
-        "LLDP/CDP...",
-    ]
+    return ["", "Link up", "Waiting for", "LLDP/CDP...", ""]
 
 
 def build_stale_lines() -> list[str]:
-    """
-    Build the screen shown when discovery data has gone stale.
-    """
-    return [
-        "RaspberryFluke",
-        "",
-        "No active",
-        "neighbor data",
-        "",
-    ]
+    return ["", "No active", "neighbor data", "", ""]
 
 
 def show_lines_if_changed(
-    display: Any,
-    app_state: RaspberryFlukeState,
+    display: object,
     lines: list[str],
     force: bool = False,
 ) -> bool:
     """
-    Show lines only if the resulting text changed.
+    Show lines on the display.
 
-    Returns:
-        True if the display was actually updated.
-        False if nothing was drawn.
+    The display module tracks its own last-shown content and skips the
+    hardware update if nothing changed, so this simply delegates.
     """
-    display_text = build_display_text(lines)
-
-    if not force and not app_state.display_text_changed(display_text):
-        return False
-
-    did_update = display.show_lines(lines, force=force)
-
-    if did_update:
-        app_state.set_display_text(display_text)
-
-    return did_update
+    return display.show_lines(lines, force=force)
 
 
-def show_startup_screen(display: Any, app_state: RaspberryFlukeState) -> None:
-    """
-    Show a startup message immediately.
-    """
-    show_lines_if_changed(
-        display=display,
-        app_state=app_state,
-        lines=build_startup_lines(),
-        force=True,
-    )
+def show_startup_screen(display: object) -> None:
+    show_lines_if_changed(display=display, lines=build_startup_lines(), force=True)
 
+
+# ============================================================
+# -------------------- LINK / TIMING HELPERS -----------------
+# ============================================================
 
 def get_link_carrier_state(interface: str) -> bool | None:
     """
     Return Ethernet carrier state for the given interface.
+
+    Reads /sys/class/net/<interface>/carrier which is updated by the
+    kernel driver in real time. This is faster and more reliable than
+    any subprocess call.
 
     Returns:
         True  -> link is up
@@ -483,7 +410,6 @@ def get_link_carrier_state(interface: str) -> bool | None:
 
     if raw_value == "1":
         return True
-
     if raw_value == "0":
         return False
 
@@ -491,92 +417,123 @@ def get_link_carrier_state(interface: str) -> bool | None:
     return None
 
 
-def seconds_since_last_success(app_state: RaspberryFlukeState, now_value: float) -> float:
+def seconds_since_last_success(
+    app_state: RaspberryFlukeState,
+    now_value: float,
+) -> float:
     """
-    Return the number of seconds since the last successful discovery.
+    Return seconds since the last successful frame parse.
 
-    If there has never been a success, return infinity.
+    Returns infinity if there has never been a success so that timeout
+    comparisons work correctly before any data is seen.
     """
     if app_state.last_success_time > 0:
         return now_value - app_state.last_success_time
-
     return float("inf")
 
 
 def clear_stale_neighbor_if_needed(
     app_state: RaspberryFlukeState,
-    display: Any,
+    display: object,
     now_value: float,
     discovery_timeout: float,
-) -> None:
+) -> bool:
     """
-    Clear active neighbor state and update the screen if the last known
-    discovery result is stale.
+    Clear active neighbor state if it has gone stale and update the screen.
+
+    Returns True if the neighbor was cleared, False if nothing changed.
     """
     if not app_state.has_neighbor():
-        return
+        return False
 
-    age_seconds = seconds_since_last_success(app_state, now_value)
+    age = seconds_since_last_success(app_state, now_value)
 
-    if age_seconds >= discovery_timeout:
+    if age >= discovery_timeout:
         log.warning(
-            "Neighbor data stale for %.2f seconds. Clearing active neighbor state.",
-            age_seconds,
+            "Neighbor data stale for %.1f seconds. Clearing state.",
+            age,
         )
         app_state.clear_neighbor()
+        show_lines_if_changed(display=display, lines=build_stale_lines())
+        return True
 
-        show_lines_if_changed(
-            display=display,
-            app_state=app_state,
-            lines=build_stale_lines(),
-        )
+    return False
 
+
+# ============================================================
+# -------------------- MAIN SERVICE LOOP ---------------------
+# ============================================================
 
 def run() -> int:
     """
     Start RaspberryFluke and keep it running until shutdown.
+
+    Loop model:
+    - When link is down: poll carrier every second, show waiting screen.
+    - When link comes up:
+        1. Open raw capture socket.
+        2. Send LLDP trigger frame to prompt an immediate switch response.
+        3. Block on receive_frame() for up to RAW_RECEIVE_TIMEOUT seconds.
+        4. When a frame arrives, parse and display immediately.
+        5. Repeat until link drops or stale timeout expires.
+
+    This event-driven approach means frame data appears on screen the
+    moment the switch responds to the trigger — typically 1-5 seconds
+    after link-up rather than 30-60 seconds with daemon-based polling.
     """
-    interface = get_network_interface()
-    startup_poll_interval = get_startup_poll_interval()
-    steady_poll_interval = get_steady_poll_interval()
+    interface        = get_network_interface()
+    receive_timeout  = get_raw_receive_timeout()
     discovery_timeout = get_discovery_timeout()
-    capture_timeout = get_capture_timeout()
 
     log.info("Starting RaspberryFluke")
-    log.info("DISPLAY_TYPE=%s", get_display_type())
-    log.info("NETWORK_INTERFACE=%s", interface)
-    log.info("STARTUP_POLL_INTERVAL=%s", startup_poll_interval)
-    log.info("STEADY_POLL_INTERVAL=%s", steady_poll_interval)
-    log.info("DISCOVERY_TIMEOUT=%s", discovery_timeout)
-    log.info("CAPTURE_TIMEOUT=%s", capture_timeout)
+    log.info("DISPLAY_TYPE=%s",        get_display_type())
+    log.info("NETWORK_INTERFACE=%s",   interface)
+    log.info("RAW_RECEIVE_TIMEOUT=%s", receive_timeout)
+    log.info("DISCOVERY_TIMEOUT=%s",   discovery_timeout)
+
+    validate_startup_config(interface)
 
     app_state = RaspberryFlukeState()
-    display = create_display()
+    display   = create_display()
 
     initialize_display(display)
-    show_startup_screen(display, app_state)
+    show_startup_screen(display)
 
+    # --- Session state ---
+    # raw_cap:           open RawCapture instance while link is up, None otherwise
+    # trigger_sent:      True after the LLDP trigger has been sent for this link session
+    # first_success_seen: True after the first neighbor has been displayed
+    raw_cap            = None
+    trigger_sent       = False
     first_success_seen = False
+    consecutive_errors = 0
 
-    while not STOP_REQUESTED:
+    while not _stop_event.is_set():
         loop_start = time.monotonic()
-
-        if first_success_seen:
-            active_poll_interval = steady_poll_interval
-        else:
-            active_poll_interval = startup_poll_interval
 
         try:
             carrier_up = get_link_carrier_state(interface)
 
-            # If link is definitely down, do not waste time calling lldpctl.
+            # --------------------------------------------------------
+            # Link is definitely down
+            # --------------------------------------------------------
             if carrier_up is False:
                 log.debug("Link is down on %s", interface)
+
+                # Close the raw socket if it was open.
+                if raw_cap is not None:
+                    raw_cap.close()
+                    raw_cap    = None
+                    trigger_sent = False
+
+                # Return to startup mode and fast polling if we had data.
+                if first_success_seen:
+                    first_success_seen = False
+                    enable_display_startup_mode(display)
 
                 if should_show_waiting_for_link_screen():
                     show_lines_if_changed(
                         display=display,
-                        app_state=app_state,
                         lines=build_waiting_for_link_lines(interface),
                     )
 
@@ -587,91 +544,131 @@ def run() -> int:
                     discovery_timeout=discovery_timeout,
                 )
 
-            else:
-                # During startup mode, do not pass the normal timeout value.
-                # capture.py only uses its shorter startup timeout when timeout
-                # is omitted.
-                if first_success_seen:
-                    raw_data = capture.capture_neighbors(
-                        interface=interface,
-                        timeout=capture_timeout,
-                        startup_mode=False,
+                # Wait before checking carrier again. Using _stop_event.wait()
+                # means a shutdown signal wakes us immediately.
+                _stop_event.wait(timeout=1.0)
+                continue
+
+            # --------------------------------------------------------
+            # Link is up (or indeterminate — proceed and let the socket handle it)
+            # --------------------------------------------------------
+
+            # Open the raw capture socket once per link session.
+            if raw_cap is None:
+                raw_cap = capture_raw.RawCapture(interface)
+
+                if not raw_cap.open():
+                    log.error(
+                        "Could not open raw capture socket on %s. "
+                        "Retrying in 5 seconds.",
+                        interface,
                     )
-                else:
-                    raw_data = capture.capture_neighbors(
-                        interface=interface,
-                        startup_mode=True,
+                    raw_cap = None
+                    _stop_event.wait(timeout=5.0)
+                    continue
+
+            # Send the LLDP trigger once per link session.
+            # This prompts the switch to advertise immediately rather than
+            # waiting for its natural advertisement interval.
+            if not trigger_sent:
+                trigger.send_lldp_trigger(interface)
+                trigger_sent = True
+                log.debug("LLDP trigger sent on %s", interface)
+
+                if should_show_waiting_for_discovery_screen():
+                    show_lines_if_changed(
+                        display=display,
+                        lines=build_waiting_for_discovery_lines(),
                     )
 
-                parsed_neighbor = parse_neighbor_data(raw_data, interface=interface)
+            # Block and wait for an LLDP or CDP frame.
+            # receive_frame() uses select() internally so it returns promptly
+            # when a frame arrives, or after receive_timeout seconds if none do.
+            protocol, frame = raw_cap.receive_frame(timeout=receive_timeout)
 
-                if parsed_neighbor is not None:
-                    neighbor_changed = app_state.neighbor_changed(parsed_neighbor)
+            if protocol is not None and frame is not None:
+                parsed = parse_neighbor_data(protocol, frame)
 
-                    app_state.update_neighbor(parsed_neighbor)
+                if parsed is not None:
+                    neighbor_changed = app_state.neighbor_changed(parsed)
+                    app_state.update_neighbor(parsed)
                     app_state.set_last_success_time(loop_start)
 
-                    display_lines = build_display_lines(parsed_neighbor)
+                    display_lines = build_display_lines(parsed)
 
-                    if show_lines_if_changed(
-                        display=display,
-                        app_state=app_state,
-                        lines=display_lines,
-                    ):
+                    if show_lines_if_changed(display=display, lines=display_lines):
                         log.info(
-                            "Display update | protocol=%s | switch=%s | port=%s | vlan=%s | voice=%s | changed=%s",
-                            parsed_neighbor["protocol"],
-                            parsed_neighbor["switch_name"],
-                            parsed_neighbor["port"],
-                            parsed_neighbor["vlan"],
-                            parsed_neighbor["voice_vlan"],
+                            "Display updated | protocol=%s | switch=%s | "
+                            "port=%s | vlan=%s | voice=%s | changed=%s",
+                            parsed["protocol"],
+                            parsed["switch_name"],
+                            parsed["port"],
+                            parsed["vlan"],
+                            parsed["voice_vlan"],
                             neighbor_changed,
                         )
                     else:
-                        log.debug("No display update needed")
+                        log.debug("Frame received but display content unchanged")
 
                     if not first_success_seen:
                         first_success_seen = True
                         disable_display_startup_mode(display)
 
-                else:
-                    age_seconds = seconds_since_last_success(app_state, loop_start)
+            else:
+                # No frame arrived within receive_timeout.
+                age = seconds_since_last_success(app_state, loop_start)
+                log.debug(
+                    "No frame received on %s | seconds since last success: %.1f",
+                    interface,
+                    age,
+                )
 
-                    log.debug(
-                        "No valid neighbor data this cycle | carrier=%s | seconds since last success: %.2f",
-                        carrier_up,
-                        age_seconds,
-                    )
+                was_cleared = clear_stale_neighbor_if_needed(
+                    app_state=app_state,
+                    display=display,
+                    now_value=loop_start,
+                    discovery_timeout=discovery_timeout,
+                )
 
-                    # Before the first success, it helps to tell the user
-                    # whether link is up but discovery data is still not ready.
-                    if not first_success_seen and carrier_up is True:
-                        if should_show_waiting_for_discovery_screen():
-                            show_lines_if_changed(
-                                display=display,
-                                app_state=app_state,
-                                lines=build_waiting_for_discovery_lines(),
-                            )
+                if was_cleared and first_success_seen:
+                    first_success_seen = False
+                    enable_display_startup_mode(display)
 
-                    clear_stale_neighbor_if_needed(
-                        app_state=app_state,
-                        display=display,
-                        now_value=loop_start,
-                        discovery_timeout=discovery_timeout,
-                    )
+            # Clean cycle — reset error counter.
+            consecutive_errors = 0
 
         except Exception:
-            log.exception("Unhandled error in main loop")
+            consecutive_errors += 1
 
-        elapsed = time.monotonic() - loop_start
-        sleep_time = max(0.0, active_poll_interval - elapsed)
+            if consecutive_errors <= _MAX_CONSECUTIVE_ERRORS:
+                log.exception(
+                    "Unhandled error in main loop (consecutive=%d)",
+                    consecutive_errors,
+                )
+            elif consecutive_errors == _MAX_CONSECUTIVE_ERRORS + 1:
+                log.error(
+                    "Error rate too high after %d consecutive failures. "
+                    "Further errors suppressed. Check hardware and logs.",
+                    consecutive_errors,
+                )
 
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+            if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                backoff = min(
+                    _BASE_BACKOFF_SECONDS * consecutive_errors,
+                    _MAX_BACKOFF_SECONDS,
+                )
+                log.debug("Backing off %.1f seconds after repeated errors", backoff)
+                _stop_event.wait(timeout=backoff)
+
+    # ----------------------------------------------------------------
+    # Shutdown
+    # ----------------------------------------------------------------
+    if raw_cap is not None:
+        raw_cap.close()
 
     log.info("Main loop exited. Shutting down display.")
     shutdown_display(display)
-    log.info("RaspberryFluke stopped cleanly")
+    log.info("RaspberryFluke stopped cleanly.")
     return 0
 
 
@@ -682,7 +679,7 @@ def main() -> int:
     setup_logging()
 
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
-    signal.signal(signal.SIGINT, handle_shutdown_signal)
+    signal.signal(signal.SIGINT,  handle_shutdown_signal)
 
     try:
         return run()

@@ -5,10 +5,11 @@ This file only handles the Waveshare 2.13" V3 e-paper display.
 
 What this file does:
 - Start the e-paper display
-- Draw text onto an image
-- Show that image on the screen
+- Draw a fixed header and 5 body lines onto an image
+- Show that image on the screen using partial or full refresh as appropriate
 - Limit how often the screen refreshes
 - Force a refresh when VLAN or VOICE changes
+- Manage ghosting by forcing a full refresh every N partial refreshes
 - Put the display to sleep when appropriate
 
 What this file does NOT do:
@@ -16,8 +17,10 @@ What this file does NOT do:
 - Capture packets
 - Parse LLDP or CDP data
 - Store broader application state
+- Decide what lines to show (that is main.py's job)
 """
 
+import logging
 import threading
 import time
 
@@ -25,28 +28,36 @@ from PIL import Image, ImageDraw, ImageFont
 from waveshare_epd import epd2in13_V3
 
 
+log = logging.getLogger(__name__)
+
+
 class EPaperDisplay:
     # Screen size in pixels for the Waveshare 2.13" V3 display.
-    DISPLAY_WIDTH = 250
+    DISPLAY_WIDTH  = 250
     DISPLAY_HEIGHT = 122
 
     # Text position on the screen.
     LEFT_MARGIN = 10
-    TOP_MARGIN = 4
+    TOP_MARGIN  = 4
 
-    # Font settings for the body lines.
+    # Font settings for the 5 body lines.
     BASE_FONT_SIZE = 16
-    MIN_FONT_SIZE = 10
-    LINE_SPACING = 2
+    MIN_FONT_SIZE  = 10
+    LINE_SPACING   = 2
 
-    # Fixed header settings.
-    TITLE_TEXT = "RaspberryFluke"
-    TITLE_FONT_SIZE = 16
+    # Fixed header drawn at the top of every screen.
+    TITLE_TEXT       = "RaspberryFluke"
+    TITLE_FONT_SIZE  = 16
     TITLE_UNDERLINE_GAP = 1
-    TITLE_BODY_GAP = 2
+    TITLE_BODY_GAP      = 2
 
     # Default font file.
     DEFAULT_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+    # Number of partial refreshes before a full refresh is forced to clear ghosting.
+    # Starting the counter at this limit ensures the very first render is always
+    # a full refresh, giving a clean slate on boot.
+    PARTIAL_REFRESH_LIMIT = 8
 
     def __init__(
         self,
@@ -54,6 +65,7 @@ class EPaperDisplay:
         min_refresh_interval=10,
         auto_sleep=True,
         startup_mode=True,
+        partial_refresh_limit=None,
     ):
         """
         Set up the display object.
@@ -68,28 +80,40 @@ class EPaperDisplay:
             If True, the panel goes back to sleep after normal updates.
 
         startup_mode:
-            If True, the display stays in a startup-friendly mode where it can
-            remain awake between updates until the first real result is shown.
-        """
-        self.font_path = font_path or self.DEFAULT_FONT_PATH
-        self.min_refresh_interval = min_refresh_interval
-        self.auto_sleep = auto_sleep
+            If True, the display stays awake between updates during early boot
+            so the panel does not repeatedly init/sleep before the first
+            real result arrives.
 
-        # Startup mode is meant to reduce early boot churn.
-        # While enabled, we do not automatically sleep after each update.
-        self.startup_mode = startup_mode
+        partial_refresh_limit:
+            Override for PARTIAL_REFRESH_LIMIT. Useful for testing.
+        """
+        self.font_path            = font_path or self.DEFAULT_FONT_PATH
+        self.min_refresh_interval = min_refresh_interval
+        self.auto_sleep           = auto_sleep
+        self.startup_mode         = startup_mode
+
+        # Allow the limit to be overridden at construction time.
+        self._partial_refresh_limit = (
+            int(partial_refresh_limit)
+            if partial_refresh_limit is not None
+            else self.PARTIAL_REFRESH_LIMIT
+        )
 
         # Create the Waveshare display object.
         self.epd = epd2in13_V3.EPD()
 
-        # RLock allows one method to safely call another method that also uses the same lock.
+        # RLock allows one method to safely call another method that also uses
+        # the same lock, which happens during sleep/wake sequences.
         self.lock = threading.RLock()
 
         # Track display state.
         self.initialized = False
-        self.sleeping = False
+        self.sleeping    = False
 
-        # Save the last 5 body lines shown on screen.
+        # Start at the limit so the first render always performs a full refresh.
+        self.partial_refresh_count = self._partial_refresh_limit
+
+        # Save the last 5 normalized body lines shown on screen.
         self.last_lines = None
 
         # Save the last refresh time.
@@ -101,34 +125,9 @@ class EPaperDisplay:
         # Load the fixed title font once.
         self.title_font = self._load_title_font()
 
-    def _build_font_cache(self):
-        """
-        Preload the body font sizes used by the display.
-
-        If the font file cannot be loaded, fall back to PIL's default font.
-        """
-        cache = {}
-
-        try:
-            for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
-                cache[size] = ImageFont.truetype(self.font_path, size)
-        except OSError:
-            default_font = ImageFont.load_default()
-            for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
-                cache[size] = default_font
-
-        return cache
-
-    def _load_title_font(self):
-        """
-        Load the fixed font used for the header.
-
-        If the configured font file cannot be loaded, fall back to PIL's default font.
-        """
-        try:
-            return ImageFont.truetype(self.font_path, self.TITLE_FONT_SIZE)
-        except OSError:
-            return ImageFont.load_default()
+    # ------------------------------------------------------------------ #
+    #  Public interface                                                    #
+    # ------------------------------------------------------------------ #
 
     def initialize(self, clear_on_start=False):
         """
@@ -136,10 +135,8 @@ class EPaperDisplay:
 
         clear_on_start:
             If True, clear the screen to white when starting up.
-
-        For RaspberryFluke appliance use, this should usually stay False so we
-        can jump directly to a boot/listening screen instead of doing an extra
-        blank-screen refresh first.
+            Leave False for faster appliance behavior so we can jump
+            directly to the boot screen without an extra blank-screen flash.
         """
         with self.lock:
             if self.initialized and not self.sleeping:
@@ -147,7 +144,11 @@ class EPaperDisplay:
 
             self.epd.init()
             self.initialized = True
-            self.sleeping = False
+            self.sleeping    = False
+
+            # After any hardware init, the next display call must be a full
+            # refresh to ensure a clean starting state.
+            self.partial_refresh_count = self._partial_refresh_limit
 
             if clear_on_start:
                 self.clear()
@@ -158,19 +159,13 @@ class EPaperDisplay:
 
         sleep_after:
             If True, put the panel back to sleep after clearing.
-
-        Note:
-            For this project, clearing on startup is usually not ideal.
-            The appliance should normally jump straight to a startup screen.
         """
         with self.lock:
             self._ensure_awake()
-
             self.epd.Clear(0xFF)
-
-            # Remember that the screen is now blank.
-            self.last_lines = ["", "", "", "", ""]
-            self.last_refresh_time = time.monotonic()
+            self.last_lines            = ["", "", "", "", ""]
+            self.last_refresh_time     = time.monotonic()
+            self.partial_refresh_count = self._partial_refresh_limit
 
             if sleep_after and self.auto_sleep and not self.startup_mode:
                 self.sleep()
@@ -179,12 +174,11 @@ class EPaperDisplay:
         """
         Put the e-paper display into sleep mode.
 
-        The image usually stays visible even after sleep.
+        The image remains visible on screen after sleep.
         """
         with self.lock:
             if not self.initialized or self.sleeping:
                 return
-
             self.epd.sleep()
             self.sleeping = True
 
@@ -194,8 +188,7 @@ class EPaperDisplay:
 
         clear_before_sleep:
             If True, blank the screen before sleeping.
-            Usually want this to stay False
-            so the last result stays visible on the screen.
+            Leave False so the last result stays visible on screen.
         """
         with self.lock:
             if not self.initialized:
@@ -205,7 +198,7 @@ class EPaperDisplay:
                 try:
                     self._ensure_awake()
                     self.epd.Clear(0xFF)
-                    self.last_lines = ["", "", "", "", ""]
+                    self.last_lines        = ["", "", "", "", ""]
                     self.last_refresh_time = time.monotonic()
                 except Exception:
                     pass
@@ -215,203 +208,266 @@ class EPaperDisplay:
             except Exception:
                 pass
 
-            self.sleeping = True
+            self.sleeping    = True
             self.initialized = False
 
     def set_startup_mode(self, enabled):
         """
         Enable or disable startup mode.
 
-        Startup mode is intended for the early boot phase where we want the
-        display to remain responsive and avoid extra wake/sleep churn.
+        Startup mode keeps the display awake between early updates to avoid
+        constant init/sleep churn before the first real result arrives.
 
         Typical use:
-        - startup_mode = True while booting and waiting for first discovery
-        - startup_mode = False after the first real neighbor result is shown
+        - startup_mode=True  while booting and waiting for first discovery
+        - startup_mode=False after the first real neighbor result is shown
         """
         with self.lock:
             self.startup_mode = bool(enabled)
 
     def show_lines(self, lines, force=False):
         """
-        Show text on the e-paper display.
+        Show 5 body lines on the e-paper display.
+
+        The fixed "RaspberryFluke" header and underline are always drawn
+        by this method. The caller does not need to include a header in lines.
 
         lines:
-            A list of body lines to show on the screen.
-            For normal neighbor screens, this should be:
-            SW / IP / PORT / VLAN / VOICE
-
-            For startup screens, if the first line is "RaspberryFluke",
-            it will be treated as the header and will not be drawn twice.
+            A list of up to 5 body text strings to show below the header.
+            Missing lines are filled with blank strings.
 
         force:
-            If True, refresh no matter what.
+            If True, refresh the display regardless of whether content changed
+            or the refresh timer has elapsed.
 
         Returns:
-            True if the screen was refreshed.
+            True if the display was refreshed.
             False if the update was skipped.
         """
         with self.lock:
             normalized_lines = self._normalize_lines(lines)
 
-            # If the body text is exactly the same as last time, skip it.
+            # Skip if body text is identical to what is already on screen.
             if not force and normalized_lines == self.last_lines:
                 return False
 
-            # If VLAN or VOICE changed, allow an immediate forced refresh.
+            # VLAN or VOICE changes always trigger an immediate refresh,
+            # bypassing the normal minimum refresh interval.
             if self._important_fields_changed(normalized_lines):
                 force = True
 
-            # If not forced, respect the normal refresh timer.
             if not force and not self._refresh_allowed():
                 return False
 
             self._ensure_awake()
 
-            image = self._render_image(lines)
+            image  = self._render_image(normalized_lines)
             buffer = self.epd.getbuffer(image)
-            self.epd.display(buffer)
 
-            # Save only the normalized body lines.
-            self.last_lines = normalized_lines
+            # Decide between partial and full refresh.
+            if self.partial_refresh_count >= self._partial_refresh_limit:
+                # Full refresh: clears ghosting, takes ~2-3 seconds.
+                self.epd.Clear(0xFF)
+                self.epd.display(buffer)
+                self.partial_refresh_count = 0
+                log.debug("Full refresh performed (ghost prevention or first render)")
+            else:
+                # Partial refresh: faster, avoids full-screen flash.
+                try:
+                    self.epd.displayPartial(buffer)
+                    self.partial_refresh_count += 1
+                    log.debug(
+                        "Partial refresh performed (%d/%d)",
+                        self.partial_refresh_count,
+                        self._partial_refresh_limit,
+                    )
+                except Exception:
+                    # If partial refresh fails, fall back to a full refresh.
+                    log.warning(
+                        "Partial refresh failed. Falling back to full refresh.",
+                        exc_info=True,
+                    )
+                    self.epd.Clear(0xFF)
+                    self.epd.display(buffer)
+                    self.partial_refresh_count = 0
+
+            self.last_lines        = normalized_lines
             self.last_refresh_time = time.monotonic()
 
-            # During startup mode, keep the display awake so repeated early
-            # screen changes do not constantly reinitialize the panel.
             if self.auto_sleep and not self.startup_mode:
                 self.sleep()
 
             return True
 
-    def _render_image(self, lines):
+    def force_refresh(self):
         """
-        Turn the text lines into an image.
+        Refresh the current screen contents again.
 
-        Behavior:
-        - Draw a fixed header at the top
-        - Center the header
-        - Underline the header
-        - Keep the header at a fixed size
-        - Fit each body line independently
+        This redraws the same body lines and resets the partial refresh
+        counter so the next call performs a full refresh.
+
+        Returns:
+            True if the display was redrawn.
+            False if there was nothing to redraw.
         """
-        image = Image.new("1", (self.DISPLAY_WIDTH, self.DISPLAY_HEIGHT), 255)
-        draw = ImageDraw.Draw(image)
+        with self.lock:
+            if self.last_lines is None:
+                return False
 
-        header_text, body_lines = self._split_header_and_body(lines)
+            # Reset the counter so the forced refresh is always a full refresh.
+            self.partial_refresh_count = self._partial_refresh_limit
+            return self.show_lines(self.last_lines, force=True)
 
-        # Draw centered fixed-size header.
-        header_width = draw.textlength(header_text, font=self.title_font)
-        header_x = int((self.DISPLAY_WIDTH - header_width) / 2)
-        header_y = self.TOP_MARGIN
-
-        draw.text((header_x, header_y), header_text, font=self.title_font, fill=0)
-
-        header_bbox = draw.textbbox((header_x, header_y), header_text, font=self.title_font)
-        underline_y = header_bbox[3] + self.TITLE_UNDERLINE_GAP
-        draw.line((header_bbox[0], underline_y, header_bbox[2], underline_y), fill=0, width=1)
-
-        # Start body below the underlined header.
-        y = underline_y + self.TITLE_BODY_GAP
-        max_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
-
-        for line in body_lines:
-            font = self._fit_font_for_line(draw, line, max_width)
-            draw.text((self.LEFT_MARGIN, y), line, font=font, fill=0)
-            y += font.size + self.LINE_SPACING
-
-        return image.rotate(180)
-
-    def _split_header_and_body(self, lines):
+    def get_status(self):
         """
-        Split incoming lines into a header and 5 body lines.
-
-        Rules:
-        - If the first provided line is exactly "RaspberryFluke",
-          treat it as the header text and use the remaining lines as body text.
-        - Otherwise, use the default fixed header and treat all provided lines
-          as body lines.
-
-        This lets old startup screens keep working without drawing the title twice.
+        Return basic display status info.
+        Useful for debugging.
         """
-        incoming = list(lines)
+        with self.lock:
+            return {
+                "initialized":             self.initialized,
+                "sleeping":                self.sleeping,
+                "startup_mode":            self.startup_mode,
+                "last_lines":              self.last_lines,
+                "last_refresh_time":       self.last_refresh_time,
+                "min_refresh_interval":    self.min_refresh_interval,
+                "auto_sleep":              self.auto_sleep,
+                "partial_refresh_count":   self.partial_refresh_count,
+                "partial_refresh_limit":   self._partial_refresh_limit,
+            }
 
-        if incoming and str(incoming[0]).strip() == self.TITLE_TEXT:
-            header_text = self.TITLE_TEXT
-            body_source = incoming[1:]
-        else:
-            header_text = self.TITLE_TEXT
-            body_source = incoming
+    # ------------------------------------------------------------------ #
+    #  Private helpers                                                     #
+    # ------------------------------------------------------------------ #
 
-        body_lines = self._normalize_body_lines(body_source)
-        return header_text, body_lines
-
-    def _fit_font_for_line(self, draw, text, max_width):
+    def _build_font_cache(self):
         """
-        Pick the largest body font size that fits within max_width for this one line.
+        Preload the body font sizes used by the display.
+
+        Falls back to PIL's default font if the font file cannot be loaded.
         """
-        for size in range(self.BASE_FONT_SIZE, self.MIN_FONT_SIZE - 1, -1):
-            font = self.font_cache[size]
+        cache = {}
+        try:
+            for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
+                cache[size] = ImageFont.truetype(self.font_path, size)
+        except OSError:
+            log.warning(
+                "Font file not found at '%s'. Using PIL default font.",
+                self.font_path,
+            )
+            default_font = ImageFont.load_default()
+            for size in range(self.MIN_FONT_SIZE, self.BASE_FONT_SIZE + 1):
+                cache[size] = default_font
+        return cache
 
-            if draw.textlength(text, font=font) <= max_width:
-                return font
-
-        return self.font_cache[self.MIN_FONT_SIZE]
-
-    def _normalize_body_lines(self, lines, max_lines=5):
+    def _load_title_font(self):
         """
-        Clean up the body lines before drawing them.
+        Load the fixed font used for the header.
+
+        Falls back to PIL's default font if the font file cannot be loaded.
+        """
+        try:
+            return ImageFont.truetype(self.font_path, self.TITLE_FONT_SIZE)
+        except OSError:
+            return ImageFont.load_default()
+
+    def _normalize_lines(self, lines, max_lines=5):
+        """
+        Clean up body lines before rendering or comparing.
 
         What this does:
-        - Keep only the first 5 body lines
+        - Keep only the first 5 lines
         - Turn None into blank text
-        - Remove extra spaces
-        - Add blank lines if fewer than 5 were provided
+        - Collapse extra whitespace
+        - Pad with blank lines if fewer than 5 were provided
         """
         cleaned = []
-
         for line in list(lines)[:max_lines]:
             if line is None:
                 cleaned.append("")
             else:
                 cleaned.append(" ".join(str(line).strip().split()))
-
         while len(cleaned) < max_lines:
             cleaned.append("")
-
         return cleaned
 
-    def _normalize_lines(self, lines):
+    def _render_image(self, body_lines):
         """
-        Return the normalized 5 body lines used for internal comparison.
+        Turn the 5 normalized body lines into a display image.
 
-        This ignores the fixed header because the header does not participate in
-        VLAN/VOICE comparisons or body-line redraw checks.
+        Always draws the fixed "RaspberryFluke" header with an underline,
+        then renders each body line below it.
+
+        A vertical overflow warning is logged if content would exceed the
+        panel height, so font size misconfigurations are visible in logs.
         """
-        _header_text, body_lines = self._split_header_and_body(lines)
-        return body_lines
+        image = Image.new("1", (self.DISPLAY_WIDTH, self.DISPLAY_HEIGHT), 255)
+        draw  = ImageDraw.Draw(image)
+
+        # Draw centered fixed-size header.
+        header_text  = self.TITLE_TEXT
+        header_width = draw.textlength(header_text, font=self.title_font)
+        header_x     = int((self.DISPLAY_WIDTH - header_width) / 2)
+        header_y     = self.TOP_MARGIN
+
+        draw.text((header_x, header_y), header_text, font=self.title_font, fill=0)
+
+        header_bbox = draw.textbbox(
+            (header_x, header_y), header_text, font=self.title_font
+        )
+        underline_y = header_bbox[3] + self.TITLE_UNDERLINE_GAP
+        draw.line(
+            (header_bbox[0], underline_y, header_bbox[2], underline_y),
+            fill=0,
+            width=1,
+        )
+
+        # Body starts below the underline.
+        y         = underline_y + self.TITLE_BODY_GAP
+        max_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
+
+        for line in body_lines:
+            if y >= self.DISPLAY_HEIGHT:
+                log.warning(
+                    "Display overflow: y=%d >= DISPLAY_HEIGHT=%d. "
+                    "Line '%s' was not drawn. Consider reducing font size.",
+                    y,
+                    self.DISPLAY_HEIGHT,
+                    line,
+                )
+                break
+
+            font = self._fit_font_for_line(draw, line, max_width)
+            draw.text((self.LEFT_MARGIN, y), line, font=font, fill=0)
+            y += font.size + self.LINE_SPACING
+
+        # Rotate so that the Ethernet port is at the top of the physical device.
+        return image.rotate(180)
+
+    def _fit_font_for_line(self, draw, text, max_width):
+        """
+        Pick the largest body font size that fits within max_width for one line.
+        """
+        for size in range(self.BASE_FONT_SIZE, self.MIN_FONT_SIZE - 1, -1):
+            font = self.font_cache[size]
+            if draw.textlength(text, font=font) <= max_width:
+                return font
+        return self.font_cache[self.MIN_FONT_SIZE]
 
     def _important_fields_changed(self, new_lines):
         """
-        Check whether VLAN or VOICE changed compared to the previous screen.
+        Check whether VLAN (index 3) or VOICE (index 4) changed.
 
-        With the fixed header design, new_lines contains body lines only:
-
-        index 0 = SW
-        index 1 = IP
-        index 2 = PORT
-        index 3 = VLAN
-        index 4 = VOICE
+        These fields trigger an immediate refresh, bypassing the normal
+        minimum refresh interval, so the technician sees changes right away.
         """
         if self.last_lines is None:
             return True
 
-        old_vlan = self.last_lines[3]
-        old_voice = self.last_lines[4]
-
-        new_vlan = new_lines[3]
-        new_voice = new_lines[4]
-
-        return old_vlan != new_vlan or old_voice != new_voice
+        return (
+            self.last_lines[3] != new_lines[3]
+            or self.last_lines[4] != new_lines[4]
+        )
 
     def _refresh_allowed(self):
         """
@@ -422,45 +478,20 @@ class EPaperDisplay:
 
     def _ensure_awake(self):
         """
-        Make sure the display is ready to use.
+        Make sure the display is ready to receive a new image.
 
-        If it was never started, start it.
-        If it was sleeping, wake it up.
+        If the display was never started or was sleeping, call init() to
+        wake it. After any hardware init, the partial refresh counter is
+        reset to the limit so the next display call performs a full refresh.
         """
         if not self.initialized:
             self.epd.init()
-            self.initialized = True
-            self.sleeping = False
+            self.initialized           = True
+            self.sleeping              = False
+            self.partial_refresh_count = self._partial_refresh_limit
             return
 
         if self.sleeping:
             self.epd.init()
-            self.sleeping = False
-
-    def force_refresh(self):
-        """
-        Refresh the current screen contents again.
-
-        This redraws the same body lines on purpose.
-        """
-        with self.lock:
-            if self.last_lines is None:
-                return False
-
-            return self.show_lines(self.last_lines, force=True)
-
-    def get_status(self):
-        """
-        Return basic display status info.
-        Useful for debugging.
-        """
-        with self.lock:
-            return {
-                "initialized": self.initialized,
-                "sleeping": self.sleeping,
-                "startup_mode": self.startup_mode,
-                "last_lines": self.last_lines,
-                "last_refresh_time": self.last_refresh_time,
-                "min_refresh_interval": self.min_refresh_interval,
-                "auto_sleep": self.auto_sleep,
-            }
+            self.sleeping              = False
+            self.partial_refresh_count = self._partial_refresh_limit

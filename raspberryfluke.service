@@ -1,7 +1,6 @@
 [Unit]
 Description=RaspberryFluke network discovery display service
-After=network.target lldpd.service
-Requires=lldpd.service
+After=network.target
 
 [Service]
 Type=simple
@@ -12,6 +11,11 @@ Environment=PYTHONPATH=/opt/raspberryfluke
 ExecStart=/usr/bin/python3 /opt/raspberryfluke/main.py
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=10
+
+# Route all output to the systemd journal.
+StandardOutput=journal
+StandardError=journal
 
 # Systemd hardening
 NoNewPrivileges=true
@@ -24,7 +28,11 @@ ProtectClock=true
 LockPersonality=true
 RestrictSUIDSGID=true
 RemoveIPC=true
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+# AF_PACKET is required for raw socket capture (capture_raw.py).
+# AF_UNIX is required for general Python runtime communication.
+# AF_NETLINK is required for network interface queries.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET
 
 [Install]
 WantedBy=multi-user.target
