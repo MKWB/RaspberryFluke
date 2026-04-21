@@ -28,7 +28,7 @@ set -euo pipefail
 # ---- Configuration ----------------------------------------
 INSTALL_DIR="/opt/raspberryfluke"
 WAVESHARE_REPO="https://github.com/waveshare/e-Paper.git"
-WAVESHARE_CLONE_DIR="/tmp/waveshare-epaper"
+WAVESHARE_CLONE_DIR="/opt/waveshare-epaper"
 WAVESHARE_LIB_SRC="$WAVESHARE_CLONE_DIR/RaspberryPi_JetsonNano/python/lib/waveshare_epd"
 WAVESHARE_LIB_DST="$INSTALL_DIR/waveshare_epd"
 SERVICE_NAME="raspberryfluke"
@@ -135,6 +135,10 @@ rm -rf "$WAVESHARE_LIB_DST"
 cp -r  "$WAVESHARE_LIB_SRC" "$WAVESHARE_LIB_DST"
 
 info "Waveshare epd library installed to $WAVESHARE_LIB_DST"
+
+# Remove the full Waveshare clone — we only needed the epd driver folder.
+info "Cleaning up Waveshare repository clone..."
+rm -rf "$WAVESHARE_CLONE_DIR"
 
 # ---- 5. File permissions ----------------------------------
 info "Setting file permissions..."
