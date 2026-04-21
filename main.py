@@ -12,6 +12,7 @@ What this file does:
 - Send an LLDP trigger frame on link-up to prompt an immediate switch response
 - Capture raw LLDP and CDP frames directly from the wire
 - Parse frames immediately as they arrive
+- Hold the first valid result behind a short loading screen per link session
 - Update the display when content changes
 - Handle graceful shutdown
 
@@ -146,6 +147,29 @@ def should_show_waiting_for_discovery_screen() -> bool:
     return bool(getattr(rfconfig, "WAITING_FOR_DISCOVERY_SCREEN", True))
 
 
+def should_show_boot_screen() -> bool:
+    return bool(getattr(rfconfig, "BOOT_SCREEN", False))
+
+
+def should_show_loading_screen_on_new_session() -> bool:
+    return bool(getattr(rfconfig, "LOADING_SCREEN_ON_NEW_SESSION", True))
+
+
+def get_result_reveal_delay() -> float:
+    """
+    Return how long to hold the loading screen before showing the
+    first valid neighbor result for a new link session.
+
+    Defaults to 2.0 seconds if the setting does not exist in rfconfig.py.
+    """
+    try:
+        value = float(getattr(rfconfig, "RESULT_REVEAL_DELAY", 2.0))
+    except (TypeError, ValueError):
+        value = 2.0
+
+    return max(0.0, value)
+
+
 # ============================================================
 # -------------------- STARTUP VALIDATION --------------------
 # ============================================================
@@ -245,6 +269,31 @@ def enable_display_startup_mode(display: object) -> None:
         display.set_startup_mode(True)
     except Exception:
         log.exception("Failed to re-enable display startup mode")
+
+
+# ============================================================
+# -------------------- SELF-FRAME FILTERING ------------------
+# ============================================================
+
+def is_self_generated_lldp_frame(frame: bytes, local_mac: bytes | None) -> bool:
+    """
+    Return True if the LLDP frame was sent by RaspberryFluke itself.
+
+    The app sends a one-shot LLDP trigger on link-up. Because raw AF_PACKET
+    sockets can see locally transmitted frames, the capture socket may read
+    that outgoing trigger back before the switch's real response arrives.
+
+    The trigger frame uses the interface MAC as the Ethernet source MAC, so
+    comparing bytes 6:12 of the Ethernet header against the local interface
+    MAC is enough to identify and discard it.
+    """
+    if local_mac is None:
+        return False
+
+    if len(frame) < 12:
+        return False
+
+    return frame[6:12] == local_mac
 
 
 # ============================================================
@@ -350,6 +399,10 @@ def build_startup_lines() -> list[str]:
     return ["", "Booting...", "Listening for", "LLDP/CDP...", ""]
 
 
+def build_loading_lines() -> list[str]:
+    return ["", "", "Loading...", "", ""]
+
+
 def build_waiting_for_link_lines(interface: str) -> list[str]:
     return ["", "Waiting for", f"link on {interface}", "...", ""]
 
@@ -378,6 +431,52 @@ def show_lines_if_changed(
 
 def show_startup_screen(display: object) -> None:
     show_lines_if_changed(display=display, lines=build_startup_lines(), force=True)
+
+
+def reveal_pending_neighbor_if_ready(
+    *,
+    display: object,
+    pending_neighbor: dict[str, str] | None,
+    reveal_deadline: float,
+    first_success_seen: bool,
+) -> tuple[bool, bool, dict[str, str] | None]:
+    """
+    Show the pending neighbor once the reveal deadline has passed.
+
+    Returns:
+        revealed_now:
+            True if the pending neighbor was just shown on screen.
+        updated_first_success_seen:
+            Updated value for first_success_seen.
+        updated_pending_neighbor:
+            None after reveal, otherwise the original pending neighbor.
+    """
+    if pending_neighbor is None:
+        return False, first_success_seen, pending_neighbor
+
+    if time.monotonic() < reveal_deadline:
+        return False, first_success_seen, pending_neighbor
+
+    display_lines = build_display_lines(pending_neighbor)
+
+    if show_lines_if_changed(display=display, lines=display_lines):
+        log.info(
+            "Display updated after loading delay | protocol=%s | switch=%s | "
+            "port=%s | vlan=%s | voice=%s",
+            pending_neighbor["protocol"],
+            pending_neighbor["switch_name"],
+            pending_neighbor["port"],
+            pending_neighbor["vlan"],
+            pending_neighbor["voice_vlan"],
+        )
+    else:
+        log.debug("Loading delay expired but display content was unchanged")
+
+    if not first_success_seen:
+        first_success_seen = True
+        disable_display_startup_mode(display)
+
+    return True, first_success_seen, None
 
 
 # ============================================================
@@ -472,24 +571,29 @@ def run() -> int:
     - When link is down: poll carrier every second, show waiting screen.
     - When link comes up:
         1. Open raw capture socket.
-        2. Send LLDP trigger frame to prompt an immediate switch response.
-        3. Block on receive_frame() for up to RAW_RECEIVE_TIMEOUT seconds.
-        4. When a frame arrives, parse and display immediately.
-        5. Repeat until link drops or stale timeout expires.
+        2. Show a loading screen for the configured reveal delay.
+        3. Send LLDP trigger frame to prompt an immediate switch response.
+        4. Capture and parse frames immediately in the background.
+        5. Hold the first valid result until the loading delay expires.
+        6. Show the newest valid result once the delay completes.
 
-    This event-driven approach means frame data appears on screen the
-    moment the switch responds to the trigger — typically 1-5 seconds
-    after link-up rather than 30-60 seconds with daemon-based polling.
+    This keeps real discovery speed fast while making the user-facing
+    transition more obvious.
     """
-    interface        = get_network_interface()
-    receive_timeout  = get_raw_receive_timeout()
-    discovery_timeout = get_discovery_timeout()
+    interface               = get_network_interface()
+    receive_timeout         = get_raw_receive_timeout()
+    discovery_timeout       = get_discovery_timeout()
+    reveal_delay            = get_result_reveal_delay()
+    loading_screen_enabled  = should_show_loading_screen_on_new_session()
+    local_mac               = trigger.get_interface_mac(interface)
 
     log.info("Starting RaspberryFluke")
-    log.info("DISPLAY_TYPE=%s",        get_display_type())
-    log.info("NETWORK_INTERFACE=%s",   interface)
-    log.info("RAW_RECEIVE_TIMEOUT=%s", receive_timeout)
-    log.info("DISCOVERY_TIMEOUT=%s",   discovery_timeout)
+    log.info("DISPLAY_TYPE=%s",                  get_display_type())
+    log.info("NETWORK_INTERFACE=%s",             interface)
+    log.info("RAW_RECEIVE_TIMEOUT=%s",           receive_timeout)
+    log.info("DISCOVERY_TIMEOUT=%s",             discovery_timeout)
+    log.info("LOADING_SCREEN_ON_NEW_SESSION=%s", loading_screen_enabled)
+    log.info("RESULT_REVEAL_DELAY=%s",           reveal_delay)
 
     validate_startup_config(interface)
 
@@ -497,16 +601,24 @@ def run() -> int:
     display   = create_display()
 
     initialize_display(display)
-    show_startup_screen(display)
+
+    if should_show_boot_screen():
+        show_startup_screen(display)
 
     # --- Session state ---
-    # raw_cap:           open RawCapture instance while link is up, None otherwise
-    # trigger_sent:      True after the LLDP trigger has been sent for this link session
-    # first_success_seen: True after the first neighbor has been displayed
-    raw_cap            = None
-    trigger_sent       = False
-    first_success_seen = False
-    consecutive_errors = 0
+    # raw_cap:                open RawCapture instance while link is up, None otherwise
+    # trigger_sent:           True after the LLDP trigger has been sent for this link session
+    # first_success_seen:     True after the first neighbor has been displayed
+    # session_loading_active: True while the loading screen delay window is active
+    # session_reveal_deadline: monotonic time when pending data may be shown
+    # pending_neighbor:       newest valid neighbor captured during the loading delay
+    raw_cap                 = None
+    trigger_sent            = False
+    first_success_seen      = False
+    session_loading_active  = False
+    session_reveal_deadline = 0.0
+    pending_neighbor        = None
+    consecutive_errors      = 0
 
     while not _stop_event.is_set():
         loop_start = time.monotonic()
@@ -523,8 +635,12 @@ def run() -> int:
                 # Close the raw socket if it was open.
                 if raw_cap is not None:
                     raw_cap.close()
-                    raw_cap    = None
-                    trigger_sent = False
+                    raw_cap = None
+
+                trigger_sent            = False
+                session_loading_active  = False
+                session_reveal_deadline = 0.0
+                pending_neighbor        = None
 
                 # Return to startup mode and fast polling if we had data.
                 if first_success_seen:
@@ -567,6 +683,26 @@ def run() -> int:
                     _stop_event.wait(timeout=5.0)
                     continue
 
+                if loading_screen_enabled and reveal_delay > 0:
+                    show_lines_if_changed(
+                        display=display,
+                        lines=build_loading_lines(),
+                        force=True,
+                    )
+                    session_loading_active  = True
+                    session_reveal_deadline = time.monotonic() + reveal_delay
+                    pending_neighbor        = None
+                    log.debug(
+                        "Loading screen shown for new session on %s. "
+                        "Result reveal deadline in %.2f seconds.",
+                        interface,
+                        reveal_delay,
+                    )
+                else:
+                    session_loading_active  = False
+                    session_reveal_deadline = 0.0
+                    pending_neighbor        = None
+
             # Send the LLDP trigger once per link session.
             # This prompts the switch to advertise immediately rather than
             # waiting for its natural advertisement interval.
@@ -575,18 +711,31 @@ def run() -> int:
                 trigger_sent = True
                 log.debug("LLDP trigger sent on %s", interface)
 
-                if should_show_waiting_for_discovery_screen():
+                if (
+                    not session_loading_active
+                    and should_show_waiting_for_discovery_screen()
+                ):
                     show_lines_if_changed(
                         display=display,
                         lines=build_waiting_for_discovery_lines(),
                     )
 
+            # If a pending result exists during the loading window, reduce the
+            # next receive timeout so the screen flips close to the reveal deadline.
+            effective_receive_timeout = receive_timeout
+
+            if session_loading_active and pending_neighbor is not None:
+                remaining = session_reveal_deadline - time.monotonic()
+                effective_receive_timeout = max(0.05, min(receive_timeout, remaining))
+
             # Block and wait for an LLDP or CDP frame.
-            # receive_frame() uses select() internally so it returns promptly
-            # when a frame arrives, or after receive_timeout seconds if none do.
-            protocol, frame = raw_cap.receive_frame(timeout=receive_timeout)
+            protocol, frame = raw_cap.receive_frame(timeout=effective_receive_timeout)
 
             if protocol is not None and frame is not None:
+                if protocol == "lldp" and is_self_generated_lldp_frame(frame, local_mac):
+                    log.debug("Ignoring self-generated LLDP trigger frame on %s", interface)
+                    continue
+
                 parsed = parse_neighbor_data(protocol, frame)
 
                 if parsed is not None:
@@ -594,28 +743,69 @@ def run() -> int:
                     app_state.update_neighbor(parsed)
                     app_state.set_last_success_time(loop_start)
 
-                    display_lines = build_display_lines(parsed)
-
-                    if show_lines_if_changed(display=display, lines=display_lines):
-                        log.info(
-                            "Display updated | protocol=%s | switch=%s | "
-                            "port=%s | vlan=%s | voice=%s | changed=%s",
+                    if session_loading_active:
+                        pending_neighbor = parsed
+                        log.debug(
+                            "Valid neighbor captured during loading delay | "
+                            "protocol=%s | switch=%s | port=%s | vlan=%s | voice=%s",
                             parsed["protocol"],
                             parsed["switch_name"],
                             parsed["port"],
                             parsed["vlan"],
                             parsed["voice_vlan"],
-                            neighbor_changed,
                         )
-                    else:
-                        log.debug("Frame received but display content unchanged")
 
-                    if not first_success_seen:
-                        first_success_seen = True
-                        disable_display_startup_mode(display)
+                        revealed_now, first_success_seen, pending_neighbor = (
+                            reveal_pending_neighbor_if_ready(
+                                display=display,
+                                pending_neighbor=pending_neighbor,
+                                reveal_deadline=session_reveal_deadline,
+                                first_success_seen=first_success_seen,
+                            )
+                        )
+
+                        if revealed_now:
+                            session_loading_active  = False
+                            session_reveal_deadline = 0.0
+                    else:
+                        display_lines = build_display_lines(parsed)
+
+                        if show_lines_if_changed(display=display, lines=display_lines):
+                            log.info(
+                                "Display updated | protocol=%s | switch=%s | "
+                                "port=%s | vlan=%s | voice=%s | changed=%s",
+                                parsed["protocol"],
+                                parsed["switch_name"],
+                                parsed["port"],
+                                parsed["vlan"],
+                                parsed["voice_vlan"],
+                                neighbor_changed,
+                            )
+                        else:
+                            log.debug("Frame received but display content unchanged")
+
+                        if not first_success_seen:
+                            first_success_seen = True
+                            disable_display_startup_mode(display)
 
             else:
                 # No frame arrived within receive_timeout.
+                if session_loading_active:
+                    revealed_now, first_success_seen, pending_neighbor = (
+                        reveal_pending_neighbor_if_ready(
+                            display=display,
+                            pending_neighbor=pending_neighbor,
+                            reveal_deadline=session_reveal_deadline,
+                            first_success_seen=first_success_seen,
+                        )
+                    )
+
+                    if revealed_now:
+                        session_loading_active  = False
+                        session_reveal_deadline = 0.0
+                        consecutive_errors = 0
+                        continue
+
                 age = seconds_since_last_success(app_state, loop_start)
                 log.debug(
                     "No frame received on %s | seconds since last success: %.1f",
