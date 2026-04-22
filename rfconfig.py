@@ -65,13 +65,6 @@ RAW_RECEIVE_TIMEOUT = 2.0
 # the switch agree on when a neighbor is considered gone.
 DISCOVERY_TIMEOUT = 180
 
-# If True, show a dedicated waiting-for-link screen when Ethernet carrier is down.
-WAITING_FOR_LINK_SCREEN = True
-
-# If True, show a dedicated waiting-for-discovery screen when link is up
-# but no LLDP or CDP frame has been received yet.
-WAITING_FOR_DISCOVERY_SCREEN = True
-
 # Log level for the application.
 # "WARNING" is recommended for normal appliance use to minimize SD card writes.
 # Use "INFO" or "DEBUG" when troubleshooting.
@@ -79,7 +72,7 @@ WAITING_FOR_DISCOVERY_SCREEN = True
 # Valid values: "DEBUG", "INFO", "WARNING", "ERROR"
 #
 # The environment variable RF_LOG_LEVEL overrides this value if set:
-#   RF_LOG_LEVEL=DEBUG python3 main.py
+# RF_LOG_LEVEL=DEBUG python3 main.py
 LOG_LEVEL = os.environ.get("RF_LOG_LEVEL", "WARNING")
 
 

@@ -139,20 +139,7 @@ def get_discovery_timeout() -> float:
     return max(1.0, value)
 
 
-def should_show_waiting_for_link_screen() -> bool:
-    return bool(getattr(rfconfig, "WAITING_FOR_LINK_SCREEN", True))
 
-
-def should_show_waiting_for_discovery_screen() -> bool:
-    return bool(getattr(rfconfig, "WAITING_FOR_DISCOVERY_SCREEN", True))
-
-
-def should_show_boot_screen() -> bool:
-    return bool(getattr(rfconfig, "BOOT_SCREEN", False))
-
-
-def should_show_loading_screen_on_new_session() -> bool:
-    return bool(getattr(rfconfig, "LOADING_SCREEN_ON_NEW_SESSION", True))
 
 
 def get_result_reveal_delay() -> float:
@@ -395,20 +382,12 @@ def build_display_lines(neighbor: dict[str, str]) -> list[str]:
     ]
 
 
-def build_startup_lines() -> list[str]:
-    return ["", "Booting...", "Listening for", "LLDP/CDP...", ""]
-
-
 def build_loading_lines() -> list[str]:
-    return ["", "", "Loading...", "", ""]
+    return ["", "", "Waiting for LLDP/CDP...", "", ""]
 
 
 def build_waiting_for_link_lines(interface: str) -> list[str]:
     return ["", "Waiting for", f"link on {interface}", "...", ""]
-
-
-def build_waiting_for_discovery_lines() -> list[str]:
-    return ["", "Link up", "Waiting for", "LLDP/CDP...", ""]
 
 
 def build_stale_lines() -> list[str]:
@@ -427,10 +406,6 @@ def show_lines_if_changed(
     hardware update if nothing changed, so this simply delegates.
     """
     return display.show_lines(lines, force=force)
-
-
-def show_startup_screen(display: object) -> None:
-    show_lines_if_changed(display=display, lines=build_startup_lines(), force=True)
 
 
 def reveal_pending_neighbor_if_ready(
@@ -584,16 +559,14 @@ def run() -> int:
     receive_timeout         = get_raw_receive_timeout()
     discovery_timeout       = get_discovery_timeout()
     reveal_delay            = get_result_reveal_delay()
-    loading_screen_enabled  = should_show_loading_screen_on_new_session()
     local_mac               = trigger.get_interface_mac(interface)
 
     log.info("Starting RaspberryFluke")
-    log.info("DISPLAY_TYPE=%s",                  get_display_type())
-    log.info("NETWORK_INTERFACE=%s",             interface)
-    log.info("RAW_RECEIVE_TIMEOUT=%s",           receive_timeout)
-    log.info("DISCOVERY_TIMEOUT=%s",             discovery_timeout)
-    log.info("LOADING_SCREEN_ON_NEW_SESSION=%s", loading_screen_enabled)
-    log.info("RESULT_REVEAL_DELAY=%s",           reveal_delay)
+    log.info("DISPLAY_TYPE=%s",        get_display_type())
+    log.info("NETWORK_INTERFACE=%s",   interface)
+    log.info("RAW_RECEIVE_TIMEOUT=%s", receive_timeout)
+    log.info("DISCOVERY_TIMEOUT=%s",   discovery_timeout)
+    log.info("RESULT_REVEAL_DELAY=%s", reveal_delay)
 
     validate_startup_config(interface)
 
@@ -601,9 +574,6 @@ def run() -> int:
     display   = create_display()
 
     initialize_display(display)
-
-    if should_show_boot_screen():
-        show_startup_screen(display)
 
     # --- Session state ---
     # raw_cap:                open RawCapture instance while link is up, None otherwise
@@ -647,8 +617,7 @@ def run() -> int:
                     first_success_seen = False
                     enable_display_startup_mode(display)
 
-                if should_show_waiting_for_link_screen():
-                    show_lines_if_changed(
+                show_lines_if_changed(
                         display=display,
                         lines=build_waiting_for_link_lines(interface),
                     )
@@ -683,30 +652,25 @@ def run() -> int:
                     _stop_event.wait(timeout=5.0)
                     continue
 
-                if loading_screen_enabled and reveal_delay > 0:
-                    show_lines_if_changed(
+                show_lines_if_changed(
                         display=display,
                         lines=build_loading_lines(),
                         force=True,
                     )
                     # Set the deadline AFTER show_lines_if_changed returns.
                     # The e-paper refresh takes ~3 seconds, so the timer only
-                    # starts once "Loading..." is physically on screen.
+                    # starts once "Waiting for LLDP/CDP..." is physically on screen.
                     # This guarantees the user sees it for at least
                     # reveal_delay additional seconds before data replaces it.
                     session_loading_active  = True
                     session_reveal_deadline = time.monotonic() + reveal_delay
                     pending_neighbor        = None
                     log.debug(
-                        "Loading screen shown for new session on %s. "
+                        "Waiting screen shown for new session on %s. "
                         "Result reveal deadline in %.2f seconds.",
                         interface,
                         reveal_delay,
                     )
-                else:
-                    session_loading_active  = False
-                    session_reveal_deadline = 0.0
-                    pending_neighbor        = None
 
             # Send the LLDP trigger once per link session.
             # This prompts the switch to advertise immediately rather than
@@ -715,15 +679,6 @@ def run() -> int:
                 trigger.send_all_triggers(interface)
                 trigger_sent = True
                 log.debug("LLDP + CDP triggers sent on %s", interface)
-
-                if (
-                    not session_loading_active
-                    and should_show_waiting_for_discovery_screen()
-                ):
-                    show_lines_if_changed(
-                        display=display,
-                        lines=build_waiting_for_discovery_lines(),
-                    )
 
             # If a pending result exists during the loading window, reduce the
             # next receive timeout so the screen flips close to the reveal deadline.
