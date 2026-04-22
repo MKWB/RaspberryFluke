@@ -163,9 +163,9 @@ def get_result_reveal_delay() -> float:
     Defaults to 2.0 seconds if the setting does not exist in rfconfig.py.
     """
     try:
-        value = float(getattr(rfconfig, "RESULT_REVEAL_DELAY", 2.0))
+        value = float(getattr(rfconfig, "RESULT_REVEAL_DELAY", 1.5))
     except (TypeError, ValueError):
-        value = 2.0
+        value = 1.5
 
     return max(0.0, value)
 
@@ -689,6 +689,11 @@ def run() -> int:
                         lines=build_loading_lines(),
                         force=True,
                     )
+                    # Set the deadline AFTER show_lines_if_changed returns.
+                    # The e-paper refresh takes ~3 seconds, so the timer only
+                    # starts once "Loading..." is physically on screen.
+                    # This guarantees the user sees it for at least
+                    # reveal_delay additional seconds before data replaces it.
                     session_loading_active  = True
                     session_reveal_deadline = time.monotonic() + reveal_delay
                     pending_neighbor        = None
@@ -707,9 +712,9 @@ def run() -> int:
             # This prompts the switch to advertise immediately rather than
             # waiting for its natural advertisement interval.
             if not trigger_sent:
-                trigger.send_lldp_trigger(interface)
+                trigger.send_all_triggers(interface)
                 trigger_sent = True
-                log.debug("LLDP trigger sent on %s", interface)
+                log.debug("LLDP + CDP triggers sent on %s", interface)
 
                 if (
                     not session_loading_active
