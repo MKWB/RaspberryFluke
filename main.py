@@ -618,9 +618,9 @@ def run() -> int:
                     enable_display_startup_mode(display)
 
                 show_lines_if_changed(
-                        display=display,
-                        lines=build_waiting_for_link_lines(interface),
-                    )
+                    display=display,
+                    lines=build_waiting_for_link_lines(interface),
+                )
 
                 clear_stale_neighbor_if_needed(
                     app_state=app_state,
@@ -657,20 +657,20 @@ def run() -> int:
                         lines=build_loading_lines(),
                         force=True,
                     )
-                    # Set the deadline AFTER show_lines_if_changed returns.
-                    # The e-paper refresh takes ~3 seconds, so the timer only
-                    # starts once "Waiting for LLDP/CDP..." is physically on screen.
-                    # This guarantees the user sees it for at least
-                    # reveal_delay additional seconds before data replaces it.
-                    session_loading_active  = True
-                    session_reveal_deadline = time.monotonic() + reveal_delay
-                    pending_neighbor        = None
-                    log.debug(
-                        "Waiting screen shown for new session on %s. "
-                        "Result reveal deadline in %.2f seconds.",
-                        interface,
-                        reveal_delay,
-                    )
+                # Set the deadline AFTER show_lines_if_changed returns.
+                # The e-paper refresh takes ~3 seconds, so the timer only
+                # starts once "Waiting for LLDP/CDP..." is physically on screen.
+                # This guarantees the user sees it for at least
+                # reveal_delay additional seconds before data replaces it.
+                session_loading_active  = True
+                session_reveal_deadline = time.monotonic() + reveal_delay
+                pending_neighbor        = None
+                log.debug(
+                    "Waiting screen shown for new session on %s. "
+                    "Result reveal deadline in %.2f seconds.",
+                    interface,
+                    reveal_delay,
+                )
 
             # Send the LLDP trigger once per link session.
             # This prompts the switch to advertise immediately rather than
