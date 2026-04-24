@@ -72,8 +72,22 @@ _CDP_VERSION     = 2
 _CDP_TRIGGER_TTL = 30              # seconds
 
 # CDP TLV type codes used in the trigger frame.
-_CDP_TLV_DEVICE_ID = 0x0001
-_CDP_TLV_PORT_ID   = 0x0003
+_CDP_TLV_DEVICE_ID    = 0x0001
+_CDP_TLV_ADDRESSES    = 0x0002
+_CDP_TLV_PORT_ID      = 0x0003
+_CDP_TLV_CAPABILITIES = 0x0004
+_CDP_TLV_SW_VERSION   = 0x0005
+_CDP_TLV_PLATFORM     = 0x0006
+
+# CDP capability bitmask — report as a Host device.
+_CDP_CAPABILITY_HOST  = 0x00000010
+
+# How many CDP trigger frames to send per link session and the gap between them.
+# Sending a burst rather than a single frame significantly improves the chance
+# of catching the switch's CDP polling window on IOS platforms that do not
+# support immediate CDP response (such as Catalyst 6500 Sup2T).
+_CDP_BURST_COUNT      = 5
+_CDP_BURST_INTERVAL   = 0.2   # seconds between frames
 
 
 # ---------------------------------------------------------------------------
@@ -256,30 +270,69 @@ def _build_cdp_tlv(tlv_type: int, value: bytes) -> bytes:
     return struct.pack("!HH", tlv_type, length) + value
 
 
+def _build_cdp_addresses_tlv() -> bytes:
+    """
+    Build a CDP Addresses TLV (type 0x0002) advertising 0.0.0.0.
+
+    Format per address entry:
+        Protocol type   : 1 byte  (1 = NLPID)
+        Protocol length : 1 byte
+        Protocol        : 1 byte  (0xCC = IP)
+        Address length  : 2 bytes
+        Address         : 4 bytes (IPv4)
+    """
+    num_addresses = struct.pack("!I", 1)
+    ip_entry = (
+        b"\x01"             # protocol type: NLPID
+        b"\x01"             # protocol length: 1
+        b"\xcc"             # NLPID for IP
+        + struct.pack("!H", 4)   # address length: 4 bytes
+        + b"\x00\x00\x00\x00"   # IP address: 0.0.0.0
+    )
+    return _build_cdp_tlv(_CDP_TLV_ADDRESSES, num_addresses + ip_entry)
+
+
 def _build_cdp_frame(src_mac: bytes, interface: str) -> bytes:
     """
-    Build a minimal valid CDP frame using 802.3/LLC/SNAP framing.
+    Build a CDP frame using 802.3/LLC/SNAP framing.
 
     Frame layout:
         Ethernet 802.3 header : dst (6) + src (6) + length (2)
         LLC                   : DSAP (1) + SSAP (1) + Control (1)
         SNAP                  : OUI (3) + PID (2)
         CDP header            : version (1) + TTL (1) + checksum (2)
-        CDP TLVs              : Device ID + Port ID
+        CDP TLVs              : Device ID, Addresses, Port ID,
+                                Capabilities, Software Version, Platform
 
-    The Device ID is set to "RaspberryFluke" so the switch can identify
-    us as a neighbor. The Port ID is the interface name.
+    Sending a fuller CDP advertisement (rather than the bare minimum of
+    Device ID and Port ID) causes Cisco IOS to treat RaspberryFluke as a
+    proper CDP neighbor, which improves the likelihood of an immediate
+    response on platforms like the Catalyst 6500.
 
     The 802.3 length field covers everything from the LLC header onward.
     The CDP checksum covers the CDP header and TLVs only.
     """
-    device_id = b"RaspberryFluke"
-    port_id   = interface.encode("ascii")
+    device_id    = b"RaspberryFluke"
+    port_id      = interface.encode("ascii")
+    sw_version   = b"RaspberryFluke Network Discovery Tool"
+    platform     = b"Raspberry Pi Zero 2W"
+    capabilities = struct.pack("!I", _CDP_CAPABILITY_HOST)
 
-    device_id_tlv = _build_cdp_tlv(_CDP_TLV_DEVICE_ID, device_id)
-    port_id_tlv   = _build_cdp_tlv(_CDP_TLV_PORT_ID,   port_id)
+    device_id_tlv    = _build_cdp_tlv(_CDP_TLV_DEVICE_ID,    device_id)
+    addresses_tlv    = _build_cdp_addresses_tlv()
+    port_id_tlv      = _build_cdp_tlv(_CDP_TLV_PORT_ID,      port_id)
+    capabilities_tlv = _build_cdp_tlv(_CDP_TLV_CAPABILITIES, capabilities)
+    sw_version_tlv   = _build_cdp_tlv(_CDP_TLV_SW_VERSION,   sw_version)
+    platform_tlv     = _build_cdp_tlv(_CDP_TLV_PLATFORM,     platform)
 
-    tlvs = device_id_tlv + port_id_tlv
+    tlvs = (
+        device_id_tlv
+        + addresses_tlv
+        + port_id_tlv
+        + capabilities_tlv
+        + sw_version_tlv
+        + platform_tlv
+    )
 
     # Build CDP PDU with checksum zeroed, compute checksum, then rebuild.
     cdp_header_no_checksum = struct.pack("!BBH", _CDP_VERSION, _CDP_TRIGGER_TTL, 0)
@@ -297,21 +350,25 @@ def _build_cdp_frame(src_mac: bytes, interface: str) -> bytes:
 
 def send_cdp_trigger(interface: str) -> bool:
     """
-    Send one CDP trigger frame on the given interface.
+    Send a burst of CDP trigger frames on the given interface.
 
-    Cisco IOS switches respond to an incoming CDP frame on a port by
-    immediately sending their own CDP advertisement. This collapses
-    discovery time from up to 60 seconds down to roughly 5-15 seconds
-    on most Cisco switches.
+    Sends _CDP_BURST_COUNT frames spaced _CDP_BURST_INTERVAL seconds apart.
+    Sending multiple frames significantly improves the chance of catching the
+    switch's CDP polling window, especially on platforms like the Catalyst 6500
+    that do not implement immediate CDP response to incoming frames.
 
-    This behavior is not formally specified in the CDP standard but is
-    consistently present across IOS versions in practice.
+    Each frame is a full CDP advertisement including Device ID, Addresses,
+    Port ID, Capabilities, Software Version, and Platform TLVs. This causes
+    the switch to recognise RaspberryFluke as a proper CDP neighbor, which
+    improves response rates compared to a minimal two-TLV frame.
 
     Parameters:
         interface : interface name such as "eth0"
 
-    Returns True if sent, False on failure.
+    Returns True if at least one frame was sent, False if MAC lookup failed.
     """
+    import time as _time
+
     src_mac = get_interface_mac(interface)
 
     if src_mac is None:
@@ -321,8 +378,16 @@ def send_cdp_trigger(interface: str) -> bool:
         )
         return False
 
-    frame = _build_cdp_frame(src_mac, interface)
-    return _send_raw_frame(interface, frame, "CDP")
+    frame   = _build_cdp_frame(src_mac, interface)
+    success = False
+
+    for i in range(_CDP_BURST_COUNT):
+        if i > 0:
+            _time.sleep(_CDP_BURST_INTERVAL)
+        if _send_raw_frame(interface, frame, f"CDP burst {i + 1}/{_CDP_BURST_COUNT}"):
+            success = True
+
+    return success
 
 
 # ---------------------------------------------------------------------------
@@ -331,15 +396,17 @@ def send_cdp_trigger(interface: str) -> bool:
 
 def send_all_triggers(interface: str) -> None:
     """
-    Send both the LLDP and CDP trigger frames on the given interface.
+    Send LLDP and CDP trigger frames on the given interface.
+
+    LLDP is sent once — a single fast-start frame is sufficient for
+    LLDP-capable switches to respond immediately.
+
+    CDP is sent as a burst — multiple frames spaced 200ms apart to catch
+    the switch's polling window on IOS platforms that do not support
+    immediate CDP response.
 
     Call this once per link session immediately after the raw capture
-    socket is opened. Sending both covers LLDP-capable switches and
-    Cisco CDP-only environments simultaneously.
-
-    Failures from either trigger are logged but do not raise exceptions.
-    The main loop continues regardless — the switch will still advertise
-    on its natural interval even if both triggers fail.
+    socket is opened. Failures are logged but do not raise exceptions.
     """
     send_lldp_trigger(interface)
     send_cdp_trigger(interface)

@@ -385,7 +385,7 @@ def build_display_lines(neighbor: dict[str, str]) -> list[str]:
 
 
 def build_loading_lines() -> list[str]:
-    return ["", "", "Loading...", "", ""]
+    return ["", "", "Waiting for LLDP/CDP...", "", ""]
 
 
 def build_waiting_for_link_lines(interface: str) -> list[str]:
