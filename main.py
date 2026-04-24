@@ -262,17 +262,19 @@ def enable_display_startup_mode(display: object) -> None:
 # -------------------- SELF-FRAME FILTERING ------------------
 # ============================================================
 
-def is_self_generated_lldp_frame(frame: bytes, local_mac: bytes | None) -> bool:
+def is_self_generated_frame(frame: bytes, local_mac: bytes | None) -> bool:
     """
-    Return True if the LLDP frame was sent by RaspberryFluke itself.
+    Return True if the frame was sent by RaspberryFluke itself.
 
-    The app sends a one-shot LLDP trigger on link-up. Because raw AF_PACKET
-    sockets can see locally transmitted frames, the capture socket may read
-    that outgoing trigger back before the switch's real response arrives.
+    The app sends LLDP and CDP trigger frames on link-up. Because raw
+    AF_PACKET sockets can see locally transmitted frames, the capture
+    socket may read those outgoing triggers back before the switch's
+    real response arrives.
 
-    The trigger frame uses the interface MAC as the Ethernet source MAC, so
-    comparing bytes 6:12 of the Ethernet header against the local interface
-    MAC is enough to identify and discard it.
+    Both triggers use the interface MAC as the Ethernet source MAC, so
+    comparing bytes 6:12 of the Ethernet header against the local
+    interface MAC is sufficient to identify and discard them regardless
+    of protocol.
     """
     if local_mac is None:
         return False
@@ -383,7 +385,7 @@ def build_display_lines(neighbor: dict[str, str]) -> list[str]:
 
 
 def build_loading_lines() -> list[str]:
-    return ["", "", "Waiting for LLDP/CDP...", "", ""]
+    return ["", "", "Loading...", "", ""]
 
 
 def build_waiting_for_link_lines(interface: str) -> list[str]:
@@ -653,10 +655,10 @@ def run() -> int:
                     continue
 
                 show_lines_if_changed(
-                        display=display,
-                        lines=build_loading_lines(),
-                        force=True,
-                    )
+                    display=display,
+                    lines=build_loading_lines(),
+                    force=True,
+                )
                 # Set the deadline AFTER show_lines_if_changed returns.
                 # The e-paper refresh takes ~3 seconds, so the timer only
                 # starts once "Waiting for LLDP/CDP..." is physically on screen.
@@ -692,8 +694,12 @@ def run() -> int:
             protocol, frame = raw_cap.receive_frame(timeout=effective_receive_timeout)
 
             if protocol is not None and frame is not None:
-                if protocol == "lldp" and is_self_generated_lldp_frame(frame, local_mac):
-                    log.debug("Ignoring self-generated LLDP trigger frame on %s", interface)
+                if is_self_generated_frame(frame, local_mac):
+                    log.debug(
+                        "Ignoring self-generated %s trigger frame on %s",
+                        protocol.upper(),
+                        interface,
+                    )
                     continue
 
                 parsed = parse_neighbor_data(protocol, frame)
