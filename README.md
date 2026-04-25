@@ -17,7 +17,7 @@ The device runs on a Raspberry Pi Zero 2 W and displays results on an e-Paper di
 ## Why This Exists
 
 
-Commercial network diagnostic tools that provide quick switch port identification can be expensive. This project explores how a small Linux-based device can extract useful switch information using LLDP/CDP and display it on a low-power screen.
+Commercial network diagnostic tools that provide quick switch port identification can be expensive. This project explores how a small Linux-based device can extract useful switch information using SNMP/LLDP/CPD and display it on a low-power screen.
 
 The goal was to build a simple, practical tool using inexpensive and widely available hardware.
 
@@ -63,7 +63,8 @@ VOICE: 130
 
 - Raspberry Pi OS
 - Python
-- LLDP/CDP parsing
+- Git
+- Raw SNMP/LLDP/CDP parsing
 - Waveshare EPD drivers
 - systemd service for automatic startup
 
@@ -83,7 +84,7 @@ The script extracts relevant switch information such as hostname, IP address, po
 
 ## Installation
 
-1. Flash Raspberry Pi OS to the SD card using Raspberry Pi Imager.
+1. Flash Raspberry Pi OS Lite (64-bit) to the SD card using Raspberry Pi Imager.
 
 2. Boot the Raspberry Pi and update the system:
 
@@ -92,10 +93,10 @@ sudo apt update
 sudo apt upgrade -y
 ```
 
-3. Install required packages:
+3. Install git:
 
 ```bash
-sudo apt -y install git lldpd python3 python3-pip python3-pil python3-spidev python3-lgpio python3-rpi.gpio python3-numpy
+sudo apt install git -y
 ```
 
 4. Enable SPI (required for the E-Paper display):
@@ -113,126 +114,26 @@ Interface Options -> SPI -> Enable
 sudo reboot
 ```
 
-6. Configure lldpd for CDP and receive-only mode:
+6. Clone the RaspberryFluke repository into /opt/raspberryfluke:
 
 ```bash
-sudo nano /etc/default/lldpd
-```
-Set:
-
-```ini
-DAEMON_ARGS="-r -c"
-LLDPD_OPTIONS=""
-```
-
-7. Restart lldpd:
-
-```bash
-sudo systemctl restart lldpd
-```
-
-8. Clone the RaspberryFluke repository into /opt:
-
-```bash
-sudo rm -rf /opt/raspberryfluke
 sudo git clone https://github.com/MKWB/RaspberryFluke.git /opt/raspberryfluke
-sudo chown -R root:root /opt/raspberryfluke
 ```
 
-9. Install the drivers for the Waveshare screen you are using:
-
-
-    Waveshare 2.13" E-Paper HAT+ display:
-
-        ```bash
-        cd ~
-        git clone https://github.com/waveshare/e-Paper.git
-        ```
-    Copy the waveshare_epd library into /opt/raspberryfluke:
-
-        ```bash
-        sudo cp -r ~/e-Paper/RaspberryPi_JetsonNano/python/lib/waveshare_epd /opt/raspberryfluke/
-        ```
-
-    OR
-
-    Waveshare 1.44inch LCD display HAT:
-
-        Install the archive extractor if needed:
-
-            ```bash
-            sudo apt update
-            sudo apt install -y p7zip-full
-            ```
-
-        Download and extract the vendor code:
-
-            ```bash
-            cd ~
-            wget https://files.waveshare.com/upload/f/fa/1.44inch-LCD-HAT-Code.7z
-            7z x 1.44inch-LCD-HAT-Code.7z
-            ```
-
-        Create the folder for the LCD driver files:
-
-            ```bash
-            sudo mkdir -p /opt/raspberryfluke/waveshare_lcd
-            ```
-
-        Copy the LCD driver files into that folder:
-
-            ```bash
-            sudo cp ~/1.44inch-LCD-HAT-Code/RaspberryPi/python/LCD_1in44.py /opt/raspberryfluke/waveshare_lcd/
-            sudo cp ~/1.44inch-LCD-HAT-Code/RaspberryPi/python/config.py /opt/raspberryfluke/waveshare_lcd/
-            ```
-
-        Create the package marker file:
-
-            ```bash
-            sudo touch /opt/raspberryfluke/waveshare_lcd/__init__.py
-            ```
-
-        Open `LCD_1in44.py`:
-
-            ```bash
-            cd /opt/raspberryfluke
-            sudo nano waveshare_lcd/LCD_1in44.py
-            ```
-
-        Change this line:
-
-            ```python
-            import config
-            ```
-
-            to this:
-
-            ```python
-            from . import config
-            ```
-
-        Save and exit:
-
-            * `Ctrl + O`
-            * `Enter`
-            * `Ctrl + X`
-
-
-10. Install the System Service File
+7. Run the Install.sh file:
 
 ```bash
-sudo cp /opt/raspberryfluke/raspberryfluke.service /etc/systemd/system/
+cd /opt/raspberryfluke
+sudo bash install.sh
 ```
 
-11. Enable and start the service:
+8. Reboot the device:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable raspberryfluke.service
-sudo systemctl start raspberryfluke.service
+sudo reboot
 ```
 
-12. Verify the service is running:
+9. Verify the service is running:
 
 ```bash
 sudo systemctl status raspberryfluke.service
