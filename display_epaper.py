@@ -113,6 +113,11 @@ class EPaperDisplay:
         # Start at the limit so the first render always performs a full refresh.
         self.partial_refresh_count = self._partial_refresh_limit
 
+        # Tracks whether displayPartBaseImage has been called at least once.
+        # Partial refresh requires both frame buffers to be seeded first.
+        # Until this is True, every refresh is forced to be a full refresh.
+        self._partial_base_ready = False
+
         # Save the last 5 normalized body lines shown on screen.
         self.last_lines = None
 
@@ -266,11 +271,14 @@ class EPaperDisplay:
             buffer = self.epd.getbuffer(image)
 
             # Decide between partial and full refresh.
-            if self.partial_refresh_count >= self._partial_refresh_limit:
-                # Full refresh: clears ghosting, takes ~2-3 seconds.
+            if self.partial_refresh_count >= self._partial_refresh_limit or not self._partial_base_ready:
+                # Full refresh: clears ghosting and seeds both e-paper frame
+                # buffers via displayPartBaseImage. Both buffers must be seeded
+                # before displayPartial can run without ghosting.
                 self.epd.Clear(0xFF)
-                self.epd.display(buffer)
-                self.partial_refresh_count = 0
+                self.epd.displayPartBaseImage(buffer)
+                self.partial_refresh_count  = 0
+                self._partial_base_ready    = True
                 log.debug("Full refresh performed (ghost prevention or first render)")
             else:
                 # Partial refresh: faster, avoids full-screen flash.
@@ -289,8 +297,9 @@ class EPaperDisplay:
                         exc_info=True,
                     )
                     self.epd.Clear(0xFF)
-                    self.epd.display(buffer)
+                    self.epd.displayPartBaseImage(buffer)
                     self.partial_refresh_count = 0
+                    self._partial_base_ready   = True
 
             self.last_lines        = normalized_lines
             self._last_protocol    = protocol_label

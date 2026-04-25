@@ -81,7 +81,7 @@ info "Installing Python packages..."
 
 # pysnmp-lextudio: pure-Python SNMP library used for active switch discovery.
 # Pillow (python3-pil above covers system install, pip ensures latest version).
-pip install pysnmp-lextudio --break-system-packages --quiet
+pip install pysnmp --break-system-packages --quiet
 
 info "Python packages installed."
 

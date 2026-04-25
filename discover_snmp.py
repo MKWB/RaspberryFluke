@@ -61,24 +61,57 @@ log = logging.getLogger(__name__)
 # SNMP import — pysnmp-lextudio
 # ============================================================
 
-try:
-    from pysnmp.hlapi import (
-        CommunityData,
-        ContextData,
-        ObjectIdentity,
-        ObjectType,
-        SnmpEngine,
-        UdpTransportTarget,
-        getCmd,
-        nextCmd,
-    )
-    _SNMP_AVAILABLE = True
-except ImportError:
+# ============================================================
+# SNMP import — supports pysnmp 4.x (classic hlapi) and 6.x (asyncio sync)
+# ============================================================
+
+import warnings as _warnings
+
+_SNMP_AVAILABLE = False
+
+# Attempt 1: classic hlapi API (pysnmp 4.x, pysnmp-lextudio).
+# The RuntimeWarning from pysnmp-lextudio's deprecation notice is suppressed
+# here — it does not indicate a failure, just that the package recommends
+# switching to pysnmp directly.
+with _warnings.catch_warnings():
+    _warnings.simplefilter("ignore", RuntimeWarning)
+    try:
+        from pysnmp.hlapi import (
+            CommunityData,
+            ContextData,
+            ObjectIdentity,
+            ObjectType,
+            SnmpEngine,
+            UdpTransportTarget,
+            getCmd,
+            nextCmd,
+        )
+        _SNMP_AVAILABLE = True
+    except ImportError:
+        pass
+
+# Attempt 2: modern pysnmp 6.x sync API.
+if not _SNMP_AVAILABLE:
+    try:
+        from pysnmp.hlapi.v3arch.asyncio.sync import (  # type: ignore[no-redef]
+            CommunityData,
+            ContextData,
+            ObjectIdentity,
+            ObjectType,
+            SnmpEngine,
+            UdpTransportTarget,
+            getCmd,
+            nextCmd,
+        )
+        _SNMP_AVAILABLE = True
+    except ImportError:
+        pass
+
+if not _SNMP_AVAILABLE:
     log.warning(
-        "pysnmp-lextudio is not installed. SNMP discovery is disabled. "
-        "Install it with: pip install pysnmp-lextudio --break-system-packages"
+        "pysnmp is not installed. SNMP discovery is disabled. "
+        "Install it with: pip install pysnmp --break-system-packages"
     )
-    _SNMP_AVAILABLE = False
 
 
 # ============================================================
