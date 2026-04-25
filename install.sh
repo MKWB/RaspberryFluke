@@ -72,18 +72,10 @@ apt-get install -y \
     python3-pil \
     python3-lgpio \
     python3-rpi.gpio \
-    fonts-dejavu-core
+    fonts-dejavu-core \
+    snmp
 
 info "System packages installed."
-
-# ---- 3. Python packages -----------------------------------
-info "Installing Python packages..."
-
-# pysnmp-lextudio: pure-Python SNMP library used for active switch discovery.
-# Pillow (python3-pil above covers system install, pip ensures latest version).
-pip install pysnmp --break-system-packages --quiet
-
-info "Python packages installed."
 
 # ---- 4. Boot time optimizations ---------------------------
 info "Applying boot time optimizations..."
