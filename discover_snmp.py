@@ -110,9 +110,9 @@ def _get_communities() -> list[str]:
 
 def _snmp_timeout() -> int:
     try:
-        return max(1, int(getattr(rfconfig, "SNMP_TIMEOUT", 2)))
+        return max(1, int(getattr(rfconfig, "SNMP_TIMEOUT", 1)))
     except (TypeError, ValueError):
-        return 2
+        return 1
 
 
 def _dhcp_wait() -> float:

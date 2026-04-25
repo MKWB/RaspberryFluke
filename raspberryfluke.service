@@ -11,7 +11,7 @@ Environment=PYTHONPATH=/opt/raspberryfluke
 ExecStart=/usr/bin/python3 /opt/raspberryfluke/main.py
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=10
+TimeoutStopSec=15
 
 # Route all output to the systemd journal.
 StandardOutput=journal

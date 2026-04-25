@@ -1,20 +1,22 @@
 """
 rfconfig.py
 
-This file stores RaspberryFluke configuration values.
+RaspberryFluke configuration.
+
+Edit this file to adjust behavior. All values have safe defaults
+that work without any changes on most networks.
 
 What this file does:
-- Define which display type the program should use
-- Store shared display settings
-- Store e-paper-specific settings
-- Store LCD-specific settings
-- Provide a simple place for users to adjust behavior
+- Define which display type to use
+- Configure the network interface
+- Set SNMP community strings to try
+- Tune timing values
 
 What this file does NOT do:
 - Initialize hardware
 - Capture packets
-- Parse LLDP or CDP data
-- Draw anything on the screen
+- Parse data
+- Draw anything on screen
 """
 
 import os
@@ -23,74 +25,94 @@ import os
 # ============================================================
 # ================= USER DISPLAY SELECTION ===================
 # ============================================================
-# Change DISPLAY_TYPE to match the display you are using.
-#
 # Valid values:
-#   "epaper"  = Waveshare 2.13" V3 e-paper display (recommended)
+#   "epaper"  = Waveshare 2.13" V3 e-paper display (default)
 #   "lcd"     = Waveshare 1.44" LCD HAT display
 #
-# The environment variable RF_DISPLAY_TYPE overrides this value if set.
-# This makes it easy to switch displays during testing without editing
-# this file:
-#   RF_DISPLAY_TYPE=lcd python3 main.py
+# The environment variable RF_DISPLAY_TYPE overrides this value.
 # ============================================================
 
 DISPLAY_TYPE = os.environ.get("RF_DISPLAY_TYPE", "epaper")
 
 
 # ============================================================
-# -------------------- SHARED SETTINGS -----------------------
+# -------------------- NETWORK SETTINGS ----------------------
+# ============================================================
+
+# Network interface to monitor.
+NETWORK_INTERFACE = "eth0"
+
+# How long to wait for any discovery method before giving up.
+# 180 seconds allows CDP's 60-second cycle to be caught up to 3 times.
+DISCOVERY_TIMEOUT = 180.0
+
+# How long after the "Scanning..." screen appears before port data is
+# allowed to replace it. This ensures the user sees the screen for at
+# least this many seconds even if SNMP responds almost instantly.
+# The e-paper draw time (~3s) is additional buffer on top of this.
+RESULT_REVEAL_DELAY = 1.5
+
+# How long to block waiting for a raw LLDP/CDP frame on each receive call.
+# 2.0 seconds keeps the passive listener responsive to link-down events.
+RAW_RECEIVE_TIMEOUT = 2.0
+
+
+# ============================================================
+# -------------------- SNMP SETTINGS -------------------------
+# ============================================================
+
+# User-defined SNMP community string.
+# If set, this is tried FIRST before the built-in list below.
+# Leave as empty string "" if you do not have a specific string.
+SNMP_USER_COMMUNITY = ""
+
+# Built-in community strings tried in order after SNMP_USER_COMMUNITY.
+# Covers the vast majority of network environments without configuration.
+SNMP_COMMUNITY_STRINGS = [
+    "public",
+    "cisco",
+    "community",
+    "private",
+    "manager",
+    "snmp",
+    "monitor",
+    "readonly",
+]
+
+# Seconds to wait for each individual SNMP response.
+# 1.0 second is sufficient for most switches while keeping the race
+# responsive — if passive wins, the SNMP thread stops within 1 second.
+SNMP_TIMEOUT = 1.0
+
+# Number of SNMP retries per query before moving to the next community string.
+SNMP_RETRIES = 1
+
+# Seconds to wait for a DHCP lease before falling back to ARP observation.
+SNMP_DHCP_WAIT = 8.0
+
+# Seconds to listen for ARP traffic when DHCP is unavailable.
+SNMP_ARP_WAIT = 3.0
+
+
+# ============================================================
+# -------------------- DISPLAY SETTINGS ----------------------
 # ============================================================
 
 # Optional font path used by both display types.
-# Leave this as-is unless you specifically want to use a different font.
 DISPLAY_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
-# Main network interface to monitor.
-NETWORK_INTERFACE = "eth0"
-
-# How long to block waiting for a raw LLDP or CDP frame on each receive call.
-# The main loop calls receive_frame() repeatedly. Each call blocks for up to
-# this many seconds. Lower values make the loop more responsive to carrier
-# changes and shutdown signals. Higher values reduce CPU usage.
-# 2.0 seconds is a good balance for an appliance with fast port changes.
-RAW_RECEIVE_TIMEOUT = 2.0
-
-# How long to wait before treating previously discovered neighbor data as
-# stale and clearing the active result.
-#
-# Reasoning: CDP advertises every 60 seconds by default. Switches hold
-# neighbor entries for 3x the advertisement interval (180 seconds) before
-# removing them. Matching that hold-time here means RaspberryFluke and
-# the switch agree on when a neighbor is considered gone.
-DISCOVERY_TIMEOUT = 180
-
-# Log level for the application.
-# "WARNING" is recommended for normal appliance use to minimize SD card writes.
-# Use "INFO" or "DEBUG" when troubleshooting.
-#
-# Valid values: "DEBUG", "INFO", "WARNING", "ERROR"
-#
-# The environment variable RF_LOG_LEVEL overrides this value if set:
-# RF_LOG_LEVEL=DEBUG python3 main.py
-LOG_LEVEL = os.environ.get("RF_LOG_LEVEL", "WARNING")
 
 
 # ============================================================
 # ------------------- E-PAPER SETTINGS -----------------------
 # ============================================================
 
-# Minimum number of seconds between normal e-paper refreshes.
-# Helps reduce unnecessary screen updates when VLAN data is stable.
+# Minimum seconds between normal e-paper refreshes.
 EPAPER_MIN_REFRESH_INTERVAL = 10
 
-# If True, the e-paper panel goes back to sleep after each update.
-# The image remains visible on screen while the panel is sleeping.
+# If True, the panel sleeps after each update (image stays visible).
 EPAPER_AUTO_SLEEP = True
 
-# Number of partial refreshes allowed before a full refresh is forced.
-# Partial refreshes are faster but accumulate ghosting artifacts over time.
-# A full refresh clears ghosting. 8 is a safe value for the Waveshare 2.13" V3.
+# Full refresh after this many partial refreshes to clear ghosting.
 EPAPER_PARTIAL_REFRESH_LIMIT = 8
 
 
@@ -98,17 +120,21 @@ EPAPER_PARTIAL_REFRESH_LIMIT = 8
 # --------------------- LCD SETTINGS -------------------------
 # ============================================================
 
-# If True, rotate the LCD image by 180 degrees before display.
-LCD_ROTATE_180 = True
-
-# If True, clear the LCD during startup.
-LCD_CLEAR_ON_START = True
-
-# LCD background color in RGB format.
-LCD_BACKGROUND_COLOR = (0, 0, 0)
-
-# LCD text color in RGB format.
-LCD_TEXT_COLOR = (255, 255, 255)
-
-# LCD backlight brightness from 0 to 100.
+LCD_ROTATE_180          = True
+LCD_CLEAR_ON_START      = True
+LCD_BACKGROUND_COLOR    = (0, 0, 0)
+LCD_TEXT_COLOR          = (255, 255, 255)
 LCD_BACKLIGHT_BRIGHTNESS = 100
+
+
+# ============================================================
+# ---------------------- LOG LEVEL ---------------------------
+# ============================================================
+# "WARNING" for normal appliance use (minimizes SD card writes).
+# "DEBUG"   for troubleshooting.
+#
+# Override without editing this file:
+#   RF_LOG_LEVEL=DEBUG python3 main.py
+# ============================================================
+
+LOG_LEVEL = os.environ.get("RF_LOG_LEVEL", "WARNING")
