@@ -141,7 +141,6 @@ fi
 # These services have no role in a headless appliance and add boot latency.
 MASK_SERVICES=(
     "triggerhappy.service"
-    "avahi-daemon.service"
     "apt-daily.timer"
     "apt-daily-upgrade.timer"
     "man-db.timer"
