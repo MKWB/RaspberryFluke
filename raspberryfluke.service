@@ -29,10 +29,11 @@ LockPersonality=true
 RestrictSUIDSGID=true
 RemoveIPC=true
 
-# AF_PACKET is required for raw socket capture (capture_raw.py).
-# AF_UNIX is required for general Python runtime communication.
+# AF_PACKET  is required for raw socket capture (capture_raw.py, trigger.py).
+# AF_UNIX    is required for general Python runtime communication.
 # AF_NETLINK is required for network interface queries.
-RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET
+# AF_INET    is required for SNMP UDP queries and DHCP socket operations.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET AF_INET
 
 [Install]
 WantedBy=multi-user.target
