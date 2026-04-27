@@ -228,15 +228,17 @@ def run() -> None:
     signal.signal(signal.SIGINT,  _sigterm_handler)
 
     # --- Configuration ---
-    interface      = str(getattr(rfconfig, "NETWORK_INTERFACE",   "eth0"))
-    disc_timeout   = float(getattr(rfconfig, "DISCOVERY_TIMEOUT", 180.0))
-    reveal_delay   = float(getattr(rfconfig, "RESULT_REVEAL_DELAY", 1.5))
+    interface            = str(getattr(rfconfig, "NETWORK_INTERFACE",     "eth0"))
+    disc_timeout         = float(getattr(rfconfig, "DISCOVERY_TIMEOUT",   120.0))
+    reveal_delay         = float(getattr(rfconfig, "RESULT_REVEAL_DELAY",   1.5))
+    partial_display_delay = float(getattr(rfconfig, "PARTIAL_DISPLAY_DELAY", 30.0))
 
     log.info("Starting RaspberryFluke")
-    log.info("DISPLAY_TYPE=%s",       _get_display_type())
-    log.info("NETWORK_INTERFACE=%s",  interface)
-    log.info("DISCOVERY_TIMEOUT=%s",  disc_timeout)
-    log.info("RESULT_REVEAL_DELAY=%s", reveal_delay)
+    log.info("DISPLAY_TYPE=%s",           _get_display_type())
+    log.info("NETWORK_INTERFACE=%s",      interface)
+    log.info("DISCOVERY_TIMEOUT=%s",      disc_timeout)
+    log.info("RESULT_REVEAL_DELAY=%s",    reveal_delay)
+    log.info("PARTIAL_DISPLAY_DELAY=%s",  partial_display_delay)
 
     # --- Verify interface exists ---
     if not _interface_exists(interface):
@@ -366,39 +368,50 @@ def run() -> None:
                 _wait_or_shutdown(shutdown_event, 1.0)
             continue
 
-        # ---- We have a result ----
-        # Enforce the reveal delay: if "Scanning..." has not been
-        # visible for at least reveal_delay seconds, wait out the remainder.
-        elapsed = time.monotonic() - scan_drawn_at
-        if elapsed < reveal_delay:
-            remainder = reveal_delay - elapsed
-            log.debug("Reveal delay: waiting %.2fs before showing result", remainder)
-            _wait_or_shutdown(shutdown_event, remainder)
+        # ---- We have a result (may be partial) ----
+        is_partial   = result.get("is_partial", False)
+        result_at    = time.monotonic()
+        displayed    = False
+
+        if is_partial:
+            log.info(
+                "Partial result from race | protocol=%s switch=%s port=%s vlan=%s",
+                result.get("protocol"),
+                result.get("switch_name"),
+                result.get("port"),
+                result.get("vlan"),
+            )
+        else:
+            # Complete result — enforce normal reveal delay then show immediately.
+            elapsed = time.monotonic() - scan_drawn_at
+            if elapsed < reveal_delay:
+                _wait_or_shutdown(shutdown_event, reveal_delay - elapsed)
+
+            if not shutdown_event.is_set():
+                protocol = result.get("protocol", "")
+                display.set_startup_mode(False)
+                _show(display, build_display_lines(result), force=True, protocol=protocol)
+                displayed = True
+                log.info(
+                    "Display updated | protocol=%s switch=%s ip=%s port=%s vlan=%s voice=%s",
+                    protocol,
+                    result.get("switch_name"),
+                    result.get("switch_ip"),
+                    result.get("port"),
+                    result.get("vlan"),
+                    result.get("voice_vlan"),
+                )
 
         if shutdown_event.is_set():
             break
 
-        protocol = result.get("protocol", "")
-        display.set_startup_mode(False)
-        _show(display, build_display_lines(result), force=True, protocol=protocol)
-
-        log.info(
-            "Display updated | protocol=%s switch=%s ip=%s port=%s vlan=%s voice=%s",
-            protocol,
-            result.get("switch_name"),
-            result.get("switch_ip"),
-            result.get("port"),
-            result.get("vlan"),
-            result.get("voice_vlan"),
-        )
-
         # ---- Monitor link while showing result ----
-        # Spawn a background passive listener that keeps hearing CDP/LLDP
-        # frames after the race completes. This serves two purposes:
-        # 1. Resets the stale timer each time the switch re-advertises
-        # 2. Updates the display if the switch data changes
+        # Background passive listener serves three purposes:
+        # 1. Resets the stale timer on every switch re-advertisement
+        # 2. Upgrades display from partial to complete when more data arrives
+        # 3. Updates display if switch data changes (e.g. VLAN reassignment)
         refresh_cancel  = threading.Event()
-        last_success_ts = [time.monotonic()]  # list so thread can mutate it
+        last_success_ts = [time.monotonic()]
         current_result  = [result]
         stale_shown     = False
 
@@ -410,31 +423,39 @@ def run() -> None:
                     cancel_event=refresh_cancel,
                     timeout=disc_timeout,
                 )
-                if fresh and not refresh_cancel.is_set():
-                    last_success_ts[0] = time.monotonic()
-                    log.debug(
-                        "Passive refresh received | protocol=%s switch=%s port=%s",
+                if not fresh or refresh_cancel.is_set():
+                    continue
+
+                last_success_ts[0] = time.monotonic()
+                log.debug(
+                    "Passive refresh | protocol=%s switch=%s port=%s partial=%s",
+                    fresh.get("protocol"),
+                    fresh.get("switch_name"),
+                    fresh.get("port"),
+                    fresh.get("is_partial"),
+                )
+
+                prev = current_result[0]
+                is_upgrade = prev.get("is_partial") and not fresh.get("is_partial")
+                data_changed = fresh != prev
+
+                if is_upgrade or data_changed:
+                    current_result[0] = fresh
+                    _show(
+                        display,
+                        build_display_lines(fresh),
+                        force=True,
+                        protocol=fresh.get("protocol", ""),
+                    )
+                    log.info(
+                        "Display %s | protocol=%s switch=%s port=%s vlan=%s voice=%s",
+                        "upgraded from partial" if is_upgrade else "refreshed",
                         fresh.get("protocol"),
                         fresh.get("switch_name"),
                         fresh.get("port"),
+                        fresh.get("vlan"),
+                        fresh.get("voice_vlan"),
                     )
-                    if fresh != current_result[0]:
-                        current_result[0] = fresh
-                        _show(
-                            display,
-                            build_display_lines(fresh),
-                            force=True,
-                            protocol=fresh.get("protocol", ""),
-                        )
-                        log.info(
-                            "Display refreshed with updated data | "
-                            "protocol=%s switch=%s port=%s vlan=%s voice=%s",
-                            fresh.get("protocol"),
-                            fresh.get("switch_name"),
-                            fresh.get("port"),
-                            fresh.get("vlan"),
-                            fresh.get("voice_vlan"),
-                        )
 
         refresh_thread = threading.Thread(
             target=_passive_refresh,
@@ -451,6 +472,40 @@ def run() -> None:
                 display.set_startup_mode(True)
                 _show(display, build_waiting_for_link_lines(), force=True)
                 break
+
+            # If result was partial and not yet displayed, check the timer.
+            # Show partial data after PARTIAL_DISPLAY_DELAY even if we still
+            # haven't received a complete result — something is better than nothing.
+            if not displayed:
+                partial_elapsed = time.monotonic() - result_at
+                if partial_elapsed >= partial_display_delay:
+                    best = current_result[0]
+                    protocol = best.get("protocol", "")
+                    display.set_startup_mode(False)
+                    _show(display, build_display_lines(best), force=True, protocol=protocol)
+                    displayed = True
+                    log.info(
+                        "Partial result displayed after %.0fs delay | "
+                        "switch=%s port=%s vlan=%s",
+                        partial_elapsed,
+                        best.get("switch_name"),
+                        best.get("port"),
+                        best.get("vlan"),
+                    )
+                elif current_result[0] != result and not current_result[0].get("is_partial"):
+                    # Background refresh already got a complete result — show it now.
+                    best = current_result[0]
+                    protocol = best.get("protocol", "")
+                    display.set_startup_mode(False)
+                    _show(display, build_display_lines(best), force=True, protocol=protocol)
+                    displayed = True
+                    log.info(
+                        "Complete result arrived during partial wait | "
+                        "switch=%s port=%s vlan=%s",
+                        best.get("switch_name"),
+                        best.get("port"),
+                        best.get("vlan"),
+                    )
 
             # Show stale warning if no refreshed data within timeout window.
             stale_elapsed = time.monotonic() - last_success_ts[0]

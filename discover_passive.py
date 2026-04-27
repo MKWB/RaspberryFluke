@@ -42,7 +42,16 @@ import rfconfig
 log = logging.getLogger(__name__)
 
 # Fields that must be non-empty for a parsed result to be considered useful.
+# Only switch_name is required — VLAN is intentionally excluded because some
+# switches (notably FortiSwitch) do not reliably advertise the access VLAN in
+# LLDP packets. Requiring VLAN would cause the display to never update on those
+# switches even when the switch name, IP, and port were parsed successfully.
 _REQUIRED_FIELDS = ("switch_name",)
+
+# Fields that must all be present for a result to be considered "complete".
+# A result that passes _has_useful_data but not _is_complete is marked as
+# partial and held for PARTIAL_DISPLAY_DELAY seconds before being shown.
+_COMPLETE_FIELDS = ("switch_name", "port")
 
 
 def _get_receive_timeout() -> float:
@@ -84,12 +93,34 @@ def _parse_frame(protocol: str, frame: bytes) -> Optional[dict]:
 
 
 def _has_useful_data(parsed: Optional[dict]) -> bool:
-    """Return True if the parsed result contains at least a switch name."""
+    """
+    Return True if the parsed result contains at least a switch name.
+
+    Deliberately does not require VLAN. FortiSwitch and some other vendors
+    omit the port VLAN ID TLV in LLDP packets. A result without VLAN is
+    still useful — it will be marked as partial but displayed after a delay.
+    """
     if not parsed:
         return False
     for field in _REQUIRED_FIELDS:
         value = parsed.get(field, "")
         if not value or str(value).strip() in ("", "Unknown", "None"):
+            return False
+    return True
+
+
+def _is_complete(result: dict) -> bool:
+    """
+    Return True if the result has all fields needed for a full display.
+
+    A result is complete when switch_name AND port are both present.
+    VLAN is deliberately excluded — its absence does not make a result
+    incomplete since some switches never advertise it.
+    """
+    _empty = {"", "Unknown", "None", "N/A"}
+    for field in _COMPLETE_FIELDS:
+        val = str(result.get(field, "")).strip()
+        if not val or val in _empty:
             return False
     return True
 
@@ -100,8 +131,13 @@ def _normalize(parsed: dict, protocol_label: str) -> dict:
 
     All fields are strings. Missing or empty values become "".
     The interface name shortener is applied to the port field.
+
+    The "is_partial" key is True when switch_name or port is missing.
+    Partial results are held by main.py for PARTIAL_DISPLAY_DELAY seconds
+    before being shown, giving the switch time to re-advertise with more
+    complete data.
     """
-    return {
+    result = {
         "protocol":    protocol_label,
         "switch_name": parse_utils.strip_domain(
                            str(parsed.get("switch_name", "")).strip()
@@ -117,6 +153,8 @@ def _normalize(parsed: dict, protocol_label: str) -> dict:
                            str(parsed.get("voice_vlan", ""))
                        ),
     }
+    result["is_partial"] = not _is_complete(result)
+    return result
 
 
 def discover(

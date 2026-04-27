@@ -43,14 +43,24 @@ DISPLAY_TYPE = os.environ.get("RF_DISPLAY_TYPE", "epaper")
 NETWORK_INTERFACE = "eth0"
 
 # How long to wait for any discovery method before giving up.
-# 180 seconds allows CDP's 60-second cycle to be caught up to 3 times.
-DISCOVERY_TIMEOUT = 180.0
+# 120 seconds allows CDP's 60-second cycle to be caught up to 2 times.
+DISCOVERY_TIMEOUT = 120.0
 
 # How long after the "Scanning..." screen appears before port data is
 # allowed to replace it. This ensures the user sees the screen for at
 # least this many seconds even if SNMP responds almost instantly.
 # The e-paper draw time (~3s) is additional buffer on top of this.
 RESULT_REVEAL_DELAY = 1.5
+
+# How long to wait before displaying a partial result (one where switch_name
+# is present but port is missing, or vice versa). Some switches such as
+# FortiSwitch omit optional LLDP TLVs like the port VLAN ID. Showing partial
+# data after this delay gives the user something useful rather than a blank
+# screen while the device continues trying to get complete information.
+# The background passive listener will upgrade the display to full data
+# the moment a complete advertisement is received.
+# Set to 0 to disable partial display entirely (wait for complete data only).
+PARTIAL_DISPLAY_DELAY = 30.0
 
 # How long to block waiting for a raw LLDP/CDP frame on each receive call.
 # 2.0 seconds keeps the passive listener responsive to link-down events.
