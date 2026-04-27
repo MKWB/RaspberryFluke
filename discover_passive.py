@@ -120,10 +120,11 @@ def _normalize(parsed: dict, protocol_label: str) -> dict:
 
 
 def discover(
-    interface:   str,
-    local_mac:   Optional[bytes],
+    interface:    str,
+    local_mac:    Optional[bytes],
     cancel_event: threading.Event,
-    timeout:     float = 180.0,
+    timeout:      float = 180.0,
+    socket_ready: Optional[threading.Event] = None,
 ) -> Optional[dict]:
     """
     Listen for LLDP or CDP frames and return the first valid result.
@@ -137,6 +138,10 @@ def discover(
         local_mac    : 6-byte MAC address used to filter self-generated frames
         cancel_event : set by race.py when another discovery method wins
         timeout      : maximum seconds to wait before returning None
+        socket_ready : optional event set after the raw socket is opened.
+                       race.py waits on this before sending trigger frames
+                       so no frames are missed due to the race condition where
+                       a switch responds before our socket is open.
 
     Returns:
         Normalized neighbor dict or None.
@@ -147,7 +152,16 @@ def discover(
     raw_cap = capture_raw.RawCapture(interface)
     if not raw_cap.open():
         log.error("Passive discovery: could not open raw socket on %s", interface)
+        # Signal ready even on failure so race.py does not hang waiting.
+        if socket_ready is not None:
+            socket_ready.set()
         return None
+
+    # Signal that the socket is open and listening.
+    # race.py waits on this before sending triggers so frames sent by the
+    # switch in response to our triggers are never missed.
+    if socket_ready is not None:
+        socket_ready.set()
 
     try:
         log.debug("Passive discovery started on %s", interface)

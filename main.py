@@ -36,6 +36,7 @@ from typing import Optional
 import rfconfig
 import race
 import trigger
+import discover_passive
 
 # Configure logging before importing display or discovery modules
 # so their loggers inherit the correct level.
@@ -169,6 +170,45 @@ def _interface_exists(interface: str) -> bool:
     return Path(f"/sys/class/net/{interface}").exists()
 
 
+def _read_link_speed(interface: str) -> int:
+    """
+    Read the negotiated link speed from sysfs.
+
+    Returns the speed in Mbps (100 or 1000 on typical ports).
+    Returns -1 if the link has not yet negotiated or the file cannot be read.
+    Auto-negotiation on 1GbE takes 1-3 seconds after physical link-up.
+    """
+    speed_path = Path(f"/sys/class/net/{interface}/speed")
+    try:
+        val = int(speed_path.read_text(encoding="ascii").strip())
+        return val if val > 0 else -1
+    except Exception:
+        return -1
+
+
+def _wait_for_negotiation(
+    interface:      str,
+    shutdown_event: threading.Event,
+    timeout:        float = 5.0,
+) -> bool:
+    """
+    Wait for Ethernet auto-negotiation to complete.
+
+    During the 1-3 seconds after physical link-up, the NIC and switch
+    are negotiating speed and duplex. No frames can be sent or received
+    during this window. This function blocks until negotiation completes
+    or the timeout expires.
+
+    Returns True if negotiation completed, False if it timed out.
+    """
+    deadline = time.monotonic() + timeout
+    while not shutdown_event.is_set() and time.monotonic() < deadline:
+        if _read_link_speed(interface) > 0:
+            return True
+        time.sleep(0.05)
+    return _read_link_speed(interface) > 0
+
+
 # ============================================================
 # -------------------- MAIN LOOP -----------------------------
 # ============================================================
@@ -233,6 +273,29 @@ def run() -> None:
 
         # ---- Link is up — start a discovery session ----
         log.info("Link up on %s — starting discovery", interface)
+
+        # Wait for auto-negotiation to complete before transmitting.
+        # During the 1-3 second negotiation window no frames can be sent
+        # or received. Polling here prevents wasted trigger frames being
+        # dropped by the NIC before the link is ready.
+        negotiated = _wait_for_negotiation(interface, shutdown_event, timeout=5.0)
+        if not negotiated:
+            log.debug("Link speed did not negotiate on %s — proceeding anyway", interface)
+
+        if shutdown_event.is_set():
+            break
+
+        if not _read_carrier(interface):
+            # Link dropped during negotiation.
+            _show(display, build_waiting_for_link_lines(), force=True)
+            continue
+
+        # Send the LLDP trigger immediately after negotiation, before the
+        # display starts drawing "Scanning...". The e-paper takes ~400ms
+        # for a partial refresh — every millisecond of head start matters
+        # on LLDP switches that respond almost immediately.
+        trigger.send_lldp_trigger(interface)
+        log.debug("Early LLDP trigger sent on %s before display draw", interface)
 
         # Show "Scanning..." and note when it finishes drawing.
         # The reveal delay timer starts AFTER the display finishes drawing
@@ -330,19 +393,67 @@ def run() -> None:
         )
 
         # ---- Monitor link while showing result ----
-        stale_shown = False
-        last_success = time.monotonic()
+        # Spawn a background passive listener that keeps hearing CDP/LLDP
+        # frames after the race completes. This serves two purposes:
+        # 1. Resets the stale timer each time the switch re-advertises
+        # 2. Updates the display if the switch data changes
+        refresh_cancel  = threading.Event()
+        last_success_ts = [time.monotonic()]  # list so thread can mutate it
+        current_result  = [result]
+        stale_shown     = False
+
+        def _passive_refresh():
+            while not shutdown_event.is_set() and not refresh_cancel.is_set():
+                fresh = discover_passive.discover(
+                    interface=interface,
+                    local_mac=local_mac,
+                    cancel_event=refresh_cancel,
+                    timeout=disc_timeout,
+                )
+                if fresh and not refresh_cancel.is_set():
+                    last_success_ts[0] = time.monotonic()
+                    log.debug(
+                        "Passive refresh received | protocol=%s switch=%s port=%s",
+                        fresh.get("protocol"),
+                        fresh.get("switch_name"),
+                        fresh.get("port"),
+                    )
+                    if fresh != current_result[0]:
+                        current_result[0] = fresh
+                        _show(
+                            display,
+                            build_display_lines(fresh),
+                            force=True,
+                            protocol=fresh.get("protocol", ""),
+                        )
+                        log.info(
+                            "Display refreshed with updated data | "
+                            "protocol=%s switch=%s port=%s vlan=%s voice=%s",
+                            fresh.get("protocol"),
+                            fresh.get("switch_name"),
+                            fresh.get("port"),
+                            fresh.get("vlan"),
+                            fresh.get("voice_vlan"),
+                        )
+
+        refresh_thread = threading.Thread(
+            target=_passive_refresh,
+            name="rf-passive-refresh",
+            daemon=True,
+        )
+        refresh_thread.start()
 
         while not shutdown_event.is_set():
             if not _read_carrier(interface):
                 log.info("Link lost on %s", interface)
+                refresh_cancel.set()
+                refresh_thread.join(timeout=3.0)
                 display.set_startup_mode(True)
                 _show(display, build_waiting_for_link_lines(), force=True)
                 break
 
-            # Show stale warning if we have not received refreshed data
-            # within the discovery timeout window.
-            stale_elapsed = time.monotonic() - last_success
+            # Show stale warning if no refreshed data within timeout window.
+            stale_elapsed = time.monotonic() - last_success_ts[0]
             if not stale_shown and stale_elapsed > disc_timeout:
                 log.info(
                     "Neighbor data stale on %s (%.0fs since last success)",
@@ -353,6 +464,8 @@ def run() -> None:
                 stale_shown = True
 
             _wait_or_shutdown(shutdown_event, 1.0)
+
+        refresh_cancel.set()
 
     # ---- Graceful shutdown ----
     log.info("Shutting down RaspberryFluke")

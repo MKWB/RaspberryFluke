@@ -4,25 +4,32 @@ race.py
 Parallel discovery race — runs all discovery methods simultaneously and
 returns the fastest valid result.
 
-Three methods run in parallel as threads:
-  1. SNMP discovery     (discover_snmp)    — primary path, fastest on most networks
-  2. Passive LLDP/CDP   (discover_passive) — fallback when SNMP is unavailable
+Two methods run in parallel as threads:
+  1. SNMP discovery   (discover_snmp)    — primary path, fastest on most networks
+  2. Passive LLDP/CDP (discover_passive) — fallback when SNMP unavailable
 
-Both threads post results to a shared queue. The first result placed in the
-queue is returned to main.py. All remaining threads are signalled to stop via
-a shared cancel event.
+A third thread runs a persistent CDP burst throughout the discovery window.
 
-Why this design:
-  - No method waits for another. The winner is whoever responds first.
-  - SNMP and passive each have clean, independent code paths.
-  - main.py stays simple — one call in, one result out.
-  - Adding a new discovery method in future requires only adding a thread here.
+Race condition fix:
+  The passive capture socket is opened BEFORE triggers are sent. A
+  threading.Event (socket_ready) is set by discover_passive the instant the
+  socket is open and listening. race.py waits on this event before sending
+  any trigger frames. This guarantees no frames from the switch are missed
+  because our socket wasn't open yet when the switch responded.
+
+Persistent CDP burst:
+  Rather than a one-shot burst at the start, CDP frames are sent continuously
+  at 100ms intervals throughout the entire discovery window. This maximises
+  the chance of catching the switch's CDP polling cycle on platforms like
+  the Catalyst 6500 that do not support immediate CDP response.
 
 What this file does:
-  - Send LLDP and CDP trigger frames immediately on link-up
-  - Spawn discovery threads
-  - Return the first valid result
-  - Signal all threads to stop once a winner is found
+  - Open passive listener socket first
+  - Wait for socket confirmation before sending triggers
+  - Start persistent CDP burst thread
+  - Spawn SNMP and passive discovery threads
+  - Return the first valid result from either thread
+  - Cancel all threads once a winner is found
 
 What this file does NOT do:
   - Implement any discovery logic
@@ -46,7 +53,6 @@ import trigger
 log = logging.getLogger(__name__)
 
 # Sentinel placed in the result queue by a thread that found nothing.
-# Allows the queue reader to count how many threads have finished.
 _NO_RESULT = object()
 
 
@@ -54,7 +60,7 @@ def run(
     interface:    str,
     local_mac:    Optional[bytes],
     cancel_event: threading.Event,
-    timeout:      float = 180.0,
+    timeout:      float = 120.0,
 ) -> Optional[dict]:
     """
     Run all discovery methods in parallel and return the first valid result.
@@ -67,30 +73,46 @@ def run(
         local_mac    : 6-byte MAC of the interface for self-frame filtering
                        and BRIDGE-MIB MAC lookup. May be None.
         cancel_event : set by main.py if link drops during discovery.
-                       Also set internally when a result is found, so all
-                       remaining threads stop promptly.
+                       Also set internally when a result is found.
         timeout      : maximum seconds for any single discovery method
 
     Returns:
         The first valid neighbor dict received from any discovery thread,
         or None if all methods timed out or were cancelled.
     """
-    # Send LLDP and CDP trigger frames immediately so the switch starts
-    # processing our presence before any discovery thread begins its work.
-    # This gives SNMP the best chance of finding us in the CDP/LLDP
-    # neighbor table when it queries ~3-5 seconds later.
-    log.debug("Race: sending triggers on %s", interface)
-    trigger.send_all_triggers(interface)
-
-    # Internal event to signal all threads to stop once a winner is found.
-    # We use a separate event from the caller's cancel_event so we can set
-    # it without affecting the caller's own shutdown logic.
+    # Internal stop event signals all threads to exit once a winner is found.
+    # Separate from cancel_event so we don't affect main.py's shutdown logic.
     internal_stop = threading.Event()
+
+    # socket_ready is set by discover_passive the moment its AF_PACKET socket
+    # is open and listening. We wait on this before sending any triggers so
+    # that switch responses are never missed due to a timing gap.
+    socket_ready = threading.Event()
 
     result_queue: queue.Queue = queue.Queue()
     num_threads = 2
 
-    def _run_snmp():
+    def _run_passive() -> None:
+        try:
+            result = discover_passive.discover(
+                interface=interface,
+                local_mac=local_mac,
+                cancel_event=internal_stop,
+                timeout=timeout,
+                socket_ready=socket_ready,
+            )
+        except Exception as exc:
+            log.exception("Passive discovery thread raised an exception: %s", exc)
+            result = None
+            # Ensure socket_ready is set even on failure.
+            socket_ready.set()
+
+        if result and not internal_stop.is_set() and not cancel_event.is_set():
+            result_queue.put(result)
+        else:
+            result_queue.put(_NO_RESULT)
+
+    def _run_snmp() -> None:
         try:
             result = discover_snmp.discover(
                 interface=interface,
@@ -102,50 +124,47 @@ def run(
             log.exception("SNMP discovery thread raised an exception: %s", exc)
             result = None
 
-        if not internal_stop.is_set() and not cancel_event.is_set() and result:
+        if result and not internal_stop.is_set() and not cancel_event.is_set():
             result_queue.put(result)
         else:
             result_queue.put(_NO_RESULT)
 
-    def _run_passive():
-        try:
-            result = discover_passive.discover(
-                interface=interface,
-                local_mac=local_mac,
-                cancel_event=internal_stop,
-                timeout=timeout,
-            )
-        except Exception as exc:
-            log.exception("Passive discovery thread raised an exception: %s", exc)
-            result = None
-
-        if not internal_stop.is_set() and not cancel_event.is_set() and result:
-            result_queue.put(result)
-        else:
-            result_queue.put(_NO_RESULT)
-
-    # Spawn threads.
-    snmp_thread = threading.Thread(
-        target=_run_snmp,
-        name="rf-snmp",
-        daemon=True,
-    )
+    # ---- Step 1: Start passive thread FIRST so socket opens immediately ----
     passive_thread = threading.Thread(
         target=_run_passive,
         name="rf-passive",
         daemon=True,
     )
-
-    log.debug("Race: starting discovery threads on %s", interface)
-    snmp_thread.start()
     passive_thread.start()
 
-    # Wait for results.
+    # ---- Step 2: Wait for passive socket to confirm open (near-instant) ----
+    # Timeout of 2.0s is a safety net — in practice this fires in <50ms.
+    if not socket_ready.wait(timeout=2.0):
+        log.warning("Race: passive socket did not open within 2s on %s", interface)
+
+    # ---- Step 3: Send triggers NOW that the socket is listening ----
+    log.debug("Race: socket ready — sending triggers on %s", interface)
+    trigger.send_all_triggers(interface)
+
+    # ---- Step 4: Start persistent CDP burst thread ----
+    # Sends CDP frames every 100ms throughout the entire discovery window.
+    burst_thread = trigger.start_persistent_cdp_burst(interface, internal_stop)
+
+    # ---- Step 5: Start SNMP thread ----
+    snmp_thread = threading.Thread(
+        target=_run_snmp,
+        name="rf-snmp",
+        daemon=True,
+    )
+    snmp_thread.start()
+
+    log.debug("Race: all discovery threads running on %s", interface)
+
+    # ---- Step 6: Wait for first result ----
     winner:       Optional[dict] = None
     threads_done: int            = 0
 
     while threads_done < num_threads:
-        # Exit early if main.py cancels (e.g. link dropped).
         if cancel_event.is_set():
             log.debug("Race: cancelled by caller on %s", interface)
             internal_stop.set()
@@ -160,18 +179,18 @@ def run(
             threads_done += 1
             continue
 
-        # A thread found something.
         winner = item
         log.debug(
             "Race: winner on %s is protocol=%s",
             interface,
             winner.get("protocol", "?"),
         )
-        internal_stop.set()   # tell remaining threads to stop
+        internal_stop.set()
         break
 
-    # Signal all threads to stop and wait for them to finish.
+    # ---- Step 7: Clean up all threads ----
     internal_stop.set()
+    burst_thread.join(timeout=2.0)
     snmp_thread.join(timeout=5.0)
     passive_thread.join(timeout=5.0)
 
@@ -185,6 +204,9 @@ def run(
             winner.get("voice_vlan"),
         )
     else:
-        log.info("Race: no result on %s (all methods exhausted or cancelled)", interface)
+        log.info(
+            "Race: no result on %s (all methods exhausted or cancelled)",
+            interface,
+        )
 
     return winner

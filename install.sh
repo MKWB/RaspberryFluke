@@ -14,15 +14,15 @@
 # The script is idempotent — safe to run again after updates.
 #
 # What this script does:
-#   1. Checks that it is running as root
-#   2. Installs required system packages
-#   3. Installs Python packages (Pillow, pysnmp-lextudio, GPIO)
-#   4. Applies boot time optimizations (Bluetooth, WiFi, HDMI, services)
-#   5. Enables SPI for the e-paper display
-#   6. Configures systemd journal persistence
-#   7. Clones the Waveshare e-Paper library and copies the driver
-#   8. Sets correct file permissions
-#   9. Installs and enables the systemd service
+#   1.  Checks that it is running as root
+#   2.  Installs required system packages
+#   3.  Applies boot time optimizations (BT, WiFi, HDMI, silent boot, services)
+#   4.  Enables SPI for the e-paper display
+#   5.  Installs udev rule for instant eth0 activation on link-up
+#   6.  Configures systemd journal persistence
+#   7.  Clones the Waveshare e-Paper library and copies the driver
+#   8.  Sets correct file permissions
+#   9.  Installs and enables the systemd service
 # ============================================================
 
 set -euo pipefail
@@ -125,8 +125,53 @@ if [[ -n "$BOOT_CONFIG" ]]; then
         info "HDMI blanking already set."
     fi
 
+    # -- Disable boot splash and remove boot delay --
+    # Eliminates the rainbow splash screen and the artificial 1-second delay.
+    if ! grep -q "disable_splash=1" "$BOOT_CONFIG" 2>/dev/null; then
+        echo "disable_splash=1" >> "$BOOT_CONFIG"
+        info "Boot splash disabled in $BOOT_CONFIG."
+    else
+        info "Boot splash already disabled."
+    fi
+
+    if ! grep -q "boot_delay=0" "$BOOT_CONFIG" 2>/dev/null; then
+        echo "boot_delay=0" >> "$BOOT_CONFIG"
+        info "Boot delay disabled in $BOOT_CONFIG."
+    else
+        info "Boot delay already set to 0."
+    fi
+
 else
     warn "Could not locate boot config.txt — skipping hardware optimizations."
+fi
+
+# -- Silent boot: suppress kernel messages on console --
+# Redirects boot output to tty3 (unused) and sets loglevel=0 to silence
+# kernel messages. Saves 1-2 seconds of visible boot spam and makes the
+# transition from boot to the RaspberryFluke display cleaner.
+CMDLINE_FILE=""
+if [[ -f /boot/firmware/cmdline.txt ]]; then
+    CMDLINE_FILE="/boot/firmware/cmdline.txt"
+elif [[ -f /boot/cmdline.txt ]]; then
+    CMDLINE_FILE="/boot/cmdline.txt"
+fi
+
+if [[ -n "$CMDLINE_FILE" ]]; then
+    # Replace console=tty1 with console=tty3 if present.
+    if grep -q "console=tty1" "$CMDLINE_FILE" 2>/dev/null; then
+        sed -i 's/console=tty1/console=tty3/' "$CMDLINE_FILE"
+        info "Console redirected to tty3 in $CMDLINE_FILE."
+    fi
+
+    # Add quiet and loglevel=0 if not already present.
+    if ! grep -q "\bquiet\b" "$CMDLINE_FILE" 2>/dev/null; then
+        sed -i 's/$/ quiet loglevel=0/' "$CMDLINE_FILE"
+        info "Silent boot (quiet loglevel=0) added to $CMDLINE_FILE."
+    else
+        info "Silent boot already configured in $CMDLINE_FILE."
+    fi
+else
+    warn "Could not locate cmdline.txt — skipping silent boot configuration."
 fi
 
 # -- Mask unused system services --
@@ -170,7 +215,27 @@ else
     fi
 fi
 
-# ---- 6. Journal persistence -------------------------------
+# ---- 6. udev rule for instant eth0 activation --------------------
+info "Installing udev rule for eth0 fast activation..."
+
+UDEV_RULE_FILE="/etc/udev/rules.d/99-raspberryfluke-eth0.rules"
+
+cat > "$UDEV_RULE_FILE" << 'EOF'
+# RaspberryFluke: Bring eth0 up in promiscuous mode the instant the kernel
+# detects a carrier signal. This fires before dhcpcd gets a chance to act,
+# ensuring the raw capture socket can be opened immediately on link-up.
+# Promiscuous mode is required to receive LLDP and CDP multicast frames.
+# dhcpcd monitors interface state changes independently and will still fire
+# its DHCP request normally after this rule runs.
+ACTION=="change", SUBSYSTEM=="net", KERNEL=="eth0", \
+    ATTR{carrier}=="1", \
+    RUN+="/sbin/ip link set eth0 up promisc on"
+EOF
+
+udevadm control --reload-rules 2>/dev/null || true
+info "udev rule installed at $UDEV_RULE_FILE."
+
+# ---- 8. Journal persistence -------------------------------
 info "Configuring systemd journal persistence..."
 
 # Create the persistent journal directory.
@@ -264,6 +329,9 @@ warn "IMPORTANT: A reboot is required for the following changes to take effect:"
 warn "  - Bluetooth disabled"
 warn "  - WiFi disabled"
 warn "  - HDMI blanking"
+warn "  - Silent boot (quiet loglevel=0)"
+warn "  - Boot splash and delay disabled"
 warn "  - SPI enabled (if newly configured)"
+warn "  - udev rule for eth0 fast activation"
 warn ""
 warn "Run: sudo reboot"

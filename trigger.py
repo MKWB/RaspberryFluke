@@ -34,6 +34,8 @@ from __future__ import annotations
 import logging
 import socket
 import struct
+import threading
+import time
 from pathlib import Path
 
 
@@ -81,13 +83,6 @@ _CDP_TLV_PLATFORM     = 0x0006
 
 # CDP capability bitmask — report as a Host device.
 _CDP_CAPABILITY_HOST  = 0x00000010
-
-# How many CDP trigger frames to send per link session and the gap between them.
-# Sending a burst rather than a single frame significantly improves the chance
-# of catching the switch's CDP polling window on IOS platforms that do not
-# support immediate CDP response (such as Catalyst 6500 Sup2T).
-_CDP_BURST_COUNT      = 5
-_CDP_BURST_INTERVAL   = 0.2   # seconds between frames
 
 
 # ---------------------------------------------------------------------------
@@ -350,63 +345,82 @@ def _build_cdp_frame(src_mac: bytes, interface: str) -> bytes:
 
 def send_cdp_trigger(interface: str) -> bool:
     """
-    Send a burst of CDP trigger frames on the given interface.
+    Send a single CDP trigger frame on the given interface.
 
-    Sends _CDP_BURST_COUNT frames spaced _CDP_BURST_INTERVAL seconds apart.
-    Sending multiple frames significantly improves the chance of catching the
-    switch's CDP polling window, especially on platforms like the Catalyst 6500
-    that do not implement immediate CDP response to incoming frames.
+    Used for the initial frame sent before the persistent burst loop starts.
+    Returns True if sent, False if MAC lookup failed.
+    """
+    src_mac = get_interface_mac(interface)
+    if src_mac is None:
+        log.warning("CDP trigger skipped: could not read MAC for %s", interface)
+        return False
+    frame = _build_cdp_frame(src_mac, interface)
+    return _send_raw_frame(interface, frame, "CDP")
 
-    Each frame is a full CDP advertisement including Device ID, Addresses,
-    Port ID, Capabilities, Software Version, and Platform TLVs. This causes
-    the switch to recognise RaspberryFluke as a proper CDP neighbor, which
-    improves response rates compared to a minimal two-TLV frame.
+
+def start_persistent_cdp_burst(
+    interface:    str,
+    cancel_event: threading.Event,
+    interval:     float = 0.1,
+) -> threading.Thread:
+    """
+    Start a background thread that sends CDP frames continuously at
+    interval seconds apart until cancel_event is set.
+
+    Sending CDP frames persistently throughout the entire discovery window
+    rather than just once at the start dramatically increases the chance
+    of catching the switch's CDP polling cycle on platforms that do not
+    support immediate CDP response (such as the Catalyst 6500 Sup2T).
 
     Parameters:
-        interface : interface name such as "eth0"
+        interface    : Ethernet interface name, e.g. "eth0"
+        cancel_event : set this to stop the burst thread
+        interval     : seconds between frames (default 100ms)
 
-    Returns True if at least one frame was sent, False if MAC lookup failed.
+    Returns the running Thread so the caller can join it on cleanup.
     """
-    import time as _time
-
     src_mac = get_interface_mac(interface)
 
     if src_mac is None:
-        log.warning(
-            "CDP trigger skipped: could not read MAC address for %s",
-            interface,
-        )
-        return False
+        log.warning("Persistent CDP burst: could not read MAC for %s", interface)
+        # Return an already-finished dummy thread.
+        t = threading.Thread(target=lambda: None, daemon=True)
+        t.start()
+        return t
 
     frame   = _build_cdp_frame(src_mac, interface)
-    success = False
+    counter = [0]
 
-    for i in range(_CDP_BURST_COUNT):
-        if i > 0:
-            _time.sleep(_CDP_BURST_INTERVAL)
-        if _send_raw_frame(interface, frame, f"CDP burst {i + 1}/{_CDP_BURST_COUNT}"):
-            success = True
+    def _burst_loop() -> None:
+        while not cancel_event.is_set():
+            counter[0] += 1
+            _send_raw_frame(interface, frame, f"CDP persistent #{counter[0]}")
+            # Use event wait so the thread wakes immediately on cancel.
+            cancel_event.wait(timeout=interval)
 
-    return success
+    t = threading.Thread(target=_burst_loop, name="rf-cdp-burst", daemon=True)
+    t.start()
+    log.debug(
+        "Persistent CDP burst started on %s (%.0fms interval)",
+        interface,
+        interval * 1000,
+    )
+    return t
 
 
 # ---------------------------------------------------------------------------
-# Combined trigger — call this from main.py
+# Combined trigger — call this from race.py
 # ---------------------------------------------------------------------------
 
 def send_all_triggers(interface: str) -> None:
     """
-    Send LLDP and CDP trigger frames on the given interface.
+    Send one LLDP frame and one initial CDP frame on the given interface.
 
-    LLDP is sent once — a single fast-start frame is sufficient for
-    LLDP-capable switches to respond immediately.
+    Called after the raw capture socket is confirmed open so no frames
+    are missed. The persistent CDP burst is started separately via
+    start_persistent_cdp_burst() so it continues throughout the window.
 
-    CDP is sent as a burst — multiple frames spaced 200ms apart to catch
-    the switch's polling window on IOS platforms that do not support
-    immediate CDP response.
-
-    Call this once per link session immediately after the raw capture
-    socket is opened. Failures are logged but do not raise exceptions.
+    Failures are logged but do not raise exceptions.
     """
     send_lldp_trigger(interface)
     send_cdp_trigger(interface)

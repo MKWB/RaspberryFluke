@@ -130,6 +130,191 @@ def _arp_wait() -> float:
 
 
 # ============================================================
+# Candidate IP discovery — ARP probe and DHCP Option 82
+# ============================================================
+
+def _get_interface_ip(interface: str) -> Optional[str]:
+    """
+    Get the IPv4 address of the interface using 'ip addr show'.
+    Returns the IP string or None if not yet configured.
+    """
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show", interface],
+            capture_output=True, text=True, timeout=2,
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("inet "):
+                return line.split()[1].split("/")[0]
+    except Exception:
+        pass
+    return None
+
+
+def _build_candidate_ips(gateway: str) -> list[str]:
+    """
+    Build a list of likely switch management IPs from the gateway.
+
+    On most networks the switch is at .1, .2, or .254 of the subnet.
+    We include the gateway itself plus these common alternatives.
+    """
+    candidates = [gateway]
+    try:
+        octets = gateway.split(".")
+        if len(octets) == 4:
+            prefix = ".".join(octets[:3])
+            for last in ("1", "2", "254"):
+                ip = f"{prefix}.{last}"
+                if ip != gateway:
+                    candidates.append(ip)
+    except Exception:
+        pass
+    return candidates
+
+
+def _send_arp_probe(interface: str, target_ip: str) -> None:
+    """
+    Send a raw ARP request for target_ip on the interface.
+
+    This prompts the switch's L3 interface to respond with its MAC and IP,
+    confirming the switch management IP without waiting for DHCP or CDP.
+    """
+    try:
+        our_mac_path = f"/sys/class/net/{interface}/address"
+        with open(our_mac_path) as f:
+            mac_str = f.read().strip()
+        src_mac = bytes(int(x, 16) for x in mac_str.split(":"))
+    except Exception:
+        return
+
+    try:
+        our_ip_str = _get_interface_ip(interface) or "0.0.0.0"
+        src_ip = socket.inet_aton(our_ip_str)
+        dst_ip = socket.inet_aton(target_ip)
+    except Exception:
+        return
+
+    # Build ARP request frame.
+    # Ethernet header: broadcast dst, our src, EtherType 0x0806
+    eth_header = b"\xff\xff\xff\xff\xff\xff" + src_mac + b"\x08\x06"
+    # ARP: HTYPE=1(Eth), PTYPE=0x0800(IP), HLEN=6, PLEN=4, OP=1(request)
+    arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1)
+    arp += src_mac + src_ip + b"\x00\x00\x00\x00\x00\x00" + dst_ip
+    frame = eth_header + arp
+
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        sock.bind((interface, 0))
+        sock.send(frame)
+        sock.close()
+        log.debug("ARP probe sent for %s on %s", target_ip, interface)
+    except Exception as exc:
+        log.debug("ARP probe failed for %s: %s", target_ip, exc)
+
+
+def _probe_candidate_ips(
+    interface:    str,
+    gateway:      str,
+    cancel_event: threading.Event,
+) -> list[str]:
+    """
+    Send ARP probes to common switch management IPs and return all candidates.
+
+    This is non-blocking — probes are sent immediately and we return
+    the full candidate list. The switch will respond asynchronously,
+    which discover_arp.py can capture if needed.
+    """
+    candidates = _build_candidate_ips(gateway)
+    for ip in candidates:
+        if cancel_event.is_set():
+            break
+        _send_arp_probe(interface, ip)
+    return candidates
+
+
+def _check_dhcp_option82(interface: str) -> Optional[dict]:
+    """
+    Check the DHCP lease file for Option 82 relay agent information.
+
+    Option 82 is inserted by DHCP-snooping switches and contains the
+    port (circuit ID) and VLAN the DHCP request arrived on. If present,
+    this gives us port info without needing CDP, LLDP, or SNMP.
+
+    This is an opportunistic check — most networks do not have Option 82
+    configured. Returns None if not found or not parseable.
+
+    The lease file is a raw binary DHCP packet. Option 82 has type 0x52
+    and contains sub-options:
+        Sub-option 1 (circuit ID): typically encodes port/VLAN info
+        Sub-option 2 (remote ID):  typically encodes switch MAC
+    """
+    # Common dhcpcd lease file locations.
+    lease_paths = [
+        f"/var/lib/dhcpcd/{interface}.lease",
+        f"/var/lib/dhcpcd5/{interface}.lease",
+        f"/run/dhcpcd/{interface}.lease",
+    ]
+
+    lease_data: Optional[bytes] = None
+    for path in lease_paths:
+        try:
+            with open(path, "rb") as f:
+                lease_data = f.read()
+            break
+        except Exception:
+            continue
+
+    if not lease_data:
+        return None
+
+    try:
+        # DHCP options start at offset 236 (after fixed fields + magic cookie).
+        # Find Option 82 (0x52 = 82).
+        i = 236
+        while i < len(lease_data) - 2:
+            opt_type = lease_data[i]
+            if opt_type == 0xFF:   # end option
+                break
+            if opt_type == 0x00:   # pad option
+                i += 1
+                continue
+            opt_len = lease_data[i + 1]
+            opt_data = lease_data[i + 2: i + 2 + opt_len]
+
+            if opt_type == 82 and len(opt_data) >= 2:
+                log.debug("DHCP Option 82 found in lease file")
+                # Parse sub-options looking for readable port info.
+                j = 0
+                circuit_id = b""
+                while j < len(opt_data) - 2:
+                    sub_type = opt_data[j]
+                    sub_len  = opt_data[j + 1]
+                    sub_data = opt_data[j + 2: j + 2 + sub_len]
+                    if sub_type == 1:
+                        circuit_id = sub_data
+                    j += 2 + sub_len
+
+                if circuit_id:
+                    # Try to decode as ASCII port info (e.g. "Gi1/0/31").
+                    try:
+                        port_str = circuit_id.decode("ascii", errors="replace").strip()
+                        # Only use if it looks like an interface name.
+                        if any(c.isalpha() for c in port_str) and "/" in port_str:
+                            log.debug("Option 82 circuit ID decoded as port: %s", port_str)
+                            return {"port": port_str}
+                    except Exception:
+                        pass
+
+            i += 2 + opt_len
+
+    except Exception as exc:
+        log.debug("Option 82 parse error: %s", exc)
+
+    return None
+
+
+# ============================================================
 # Gateway IP discovery
 # ============================================================
 
@@ -599,14 +784,34 @@ def discover(
 
     log.debug("SNMP discovery: gateway = %s", gateway)
 
-    # Phase 2 — Try SNMP community strings in order.
-    for community in _get_communities():
+    # Phase 1b — Check DHCP Option 82 for port info (opportunistic).
+    option82 = _check_dhcp_option82(interface)
+    if option82:
+        log.debug("SNMP: Option 82 data found: %s", option82)
+
+    # Phase 1c — Send ARP probes to common switch management IPs.
+    # This is fire-and-forget — probes hit the wire immediately and may
+    # cause the switch to populate our ARP cache for faster SNMP access.
+    candidates = _probe_candidate_ips(interface, gateway, cancel_event)
+    log.debug("SNMP: candidate IPs to try: %s", candidates)
+
+    # Phase 2 — Try SNMP community strings against each candidate IP.
+    communities = _get_communities()
+
+    for candidate in candidates:
         if cancel_event.is_set() or time.monotonic() > deadline:
             return None
 
-        result = _query_switch(gateway, community, local_mac, cancel_event)
-        if result:
-            return result
+        for community in communities:
+            if cancel_event.is_set() or time.monotonic() > deadline:
+                return None
 
-    log.debug("SNMP discovery: all community strings failed on %s", gateway)
+            result = _query_switch(candidate, community, local_mac, cancel_event)
+            if result:
+                # Merge Option 82 port data if SNMP didn't find a port.
+                if option82 and not result.get("port") and option82.get("port"):
+                    result["port"] = parse_utils.shorten_interface_name(option82["port"])
+                return result
+
+    log.debug("SNMP discovery: all community strings failed on all candidates")
     return None
