@@ -133,26 +133,32 @@ Insert the SD card, connect power, and SSH into the device. Then update the syst
 sudo apt update && sudo apt upgrade -y
 ```
 
-### 3. Clone the repository
+### 3. Install git
+
+```bash
+sudo apt install git -y
+```
+
+### 4. Clone the repository
 
 ```bash
 sudo git clone https://github.com/MKWB/RaspberryFluke.git /opt/raspberryfluke
 ```
 
-### 4. Run the installer
+### 5. Run the installer
 
 ```bash
 cd /opt/raspberryfluke
 sudo bash install.sh
 ```
 
-### 5. Reboot
+### 6. Reboot
 
 ```bash
 sudo reboot
 ```
 
-### 6. Verify
+### 7. Verify
 
 ```bash
 sudo systemctl status raspberryfluke.service
