@@ -1,6 +1,11 @@
 [Unit]
 Description=RaspberryFluke network discovery display service
-After=network.target
+# Use network-pre.target instead of network.target so the service starts
+# as soon as the network interface exists, without waiting for a full
+# network stack (DHCP lease, DNS, etc.) to be ready. RaspberryFluke
+# manages its own DHCP awareness via /proc/net/route polling.
+After=sysinit.target local-fs.target
+Wants=network-pre.target
 
 [Service]
 Type=simple

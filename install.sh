@@ -15,14 +15,16 @@
 #
 # What this script does:
 #   1.  Checks that it is running as root
-#   2.  Installs required system packages
-#   3.  Applies boot time optimizations (BT, WiFi, HDMI, silent boot, services)
+#   2.  Installs required system packages (including snmp tools)
+#   3.  Applies boot time optimizations (BT, WiFi, HDMI, silent boot,
+#       serial console, cloud-init, NetworkManager → systemd-networkd)
 #   4.  Enables SPI for the e-paper display
 #   5.  Installs udev rule for instant eth0 activation on link-up
-#   6.  Configures systemd journal persistence
-#   7.  Clones the Waveshare e-Paper library and copies the driver
-#   8.  Sets correct file permissions
-#   9.  Installs and enables the systemd service
+#   6.  Creates systemd-networkd config for eth0
+#   7.  Configures systemd journal persistence
+#   8.  Clones the Waveshare e-Paper library and copies the driver
+#   9.  Sets correct file permissions
+#   10. Installs and enables the systemd service
 # ============================================================
 
 set -euo pipefail
@@ -181,11 +183,58 @@ MASK_SERVICES=(
     "apt-daily.timer"
     "apt-daily-upgrade.timer"
     "man-db.timer"
+    "NetworkManager.service"
+    "NetworkManager-wait-online.service"
+    "cloud-init-main.service"
+    "cloud-init-local.service"
+    "cloud-init-network.service"
+    "cloud-config.service"
+    "cloud-final.service"
 )
 for svc in "${MASK_SERVICES[@]}"; do
     systemctl mask "$svc" 2>/dev/null || true
 done
-info "Unused services masked."
+
+# Disable cloud-init via its own flag file — belt and suspenders approach.
+touch /etc/cloud/cloud-init.disabled 2>/dev/null || true
+
+# Switch from NetworkManager to systemd-networkd.
+# systemd-networkd is built into systemd, requires no extra packages,
+# and starts in under 200ms vs NetworkManager's 10-14 seconds.
+systemctl disable NetworkManager 2>/dev/null || true
+systemctl enable  systemd-networkd 2>/dev/null || true
+
+# Create network config for eth0 if it doesn't exist.
+NETWORKD_CONF="/etc/systemd/network/10-eth0.network"
+if [[ ! -f "$NETWORKD_CONF" ]]; then
+    mkdir -p /etc/systemd/network
+    cat > "$NETWORKD_CONF" << 'EOF'
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+
+[DHCP]
+RouteMetric=100
+EOF
+    info "systemd-networkd config created at $NETWORKD_CONF."
+else
+    info "systemd-networkd config already exists."
+fi
+
+# Remove serial console from cmdline.txt — it adds latency on boot
+# since we disabled Bluetooth which shared the UART.
+if [[ -n "$CMDLINE_FILE" ]]; then
+    if grep -q "console=serial0" "$CMDLINE_FILE" 2>/dev/null; then
+        sed -i 's/console=serial0,[0-9]* //' "$CMDLINE_FILE"
+        info "Serial console removed from $CMDLINE_FILE."
+    else
+        info "Serial console already removed from $CMDLINE_FILE."
+    fi
+fi
+
+info "Unused services masked. NetworkManager replaced with systemd-networkd."
 
 info "Boot optimizations applied. Reboot required for hardware changes to take effect."
 
@@ -235,7 +284,7 @@ EOF
 udevadm control --reload-rules 2>/dev/null || true
 info "udev rule installed at $UDEV_RULE_FILE."
 
-# ---- 8. Journal persistence -------------------------------
+# ---- 7. Journal persistence -------------------------------
 info "Configuring systemd journal persistence..."
 
 # Create the persistent journal directory.
@@ -258,7 +307,7 @@ EOF
 systemctl restart systemd-journald
 info "Journal persistence configured."
 
-# ---- 7. Waveshare e-Paper library -------------------------
+# ---- 8. Waveshare e-Paper library -------------------------
 info "Setting up Waveshare e-Paper library..."
 
 if [[ -d "$WAVESHARE_CLONE_DIR" ]]; then
@@ -287,7 +336,7 @@ info "Waveshare epd library installed to $WAVESHARE_LIB_DST"
 info "Cleaning up Waveshare repository clone..."
 rm -rf "$WAVESHARE_CLONE_DIR"
 
-# ---- 8. File permissions ----------------------------------
+# ---- 9. File permissions ----------------------------------
 info "Setting file permissions..."
 
 chown -R root:root "$INSTALL_DIR"
@@ -295,7 +344,7 @@ chmod 755 "$INSTALL_DIR/main.py"
 
 info "Permissions set."
 
-# ---- 9. Systemd service -----------------------------------
+# ---- 10. Systemd service -----------------------------------
 info "Installing systemd service..."
 
 SERVICE_SRC="$INSTALL_DIR/raspberryfluke.service"
@@ -331,7 +380,9 @@ warn "  - WiFi disabled"
 warn "  - HDMI blanking"
 warn "  - Silent boot (quiet loglevel=0)"
 warn "  - Boot splash and delay disabled"
+warn "  - Serial console removed"
 warn "  - SPI enabled (if newly configured)"
 warn "  - udev rule for eth0 fast activation"
+warn "  - NetworkManager replaced with systemd-networkd"
 warn ""
 warn "Run: sudo reboot"
