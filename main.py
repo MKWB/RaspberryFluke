@@ -109,9 +109,9 @@ def _truncate(text: str, max_len: int) -> str:
 def build_display_lines(neighbor: dict) -> list[str]:
     """Build the 5 body lines for a valid neighbor result."""
     return [
-        _truncate(neighbor.get("switch_name", "Unknown"), 22),
-        _truncate(neighbor.get("switch_ip",   "Unknown"), 22),
-        _truncate(neighbor.get("port",         "Unknown"), 22),
+        f"SW: {_truncate(neighbor.get('switch_name', 'Unknown'), 18)}",
+        f"IP: {_truncate(neighbor.get('switch_ip',   'Unknown'), 18)}",
+        f"PORT: {_truncate(neighbor.get('port',       'Unknown'), 16)}",
         f"VLAN: {neighbor.get('vlan', 'Unknown')}",
         f"VOICE: {neighbor.get('voice_vlan', 'None')}",
     ]
