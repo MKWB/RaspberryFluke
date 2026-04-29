@@ -116,7 +116,7 @@ If no switch data is received within 120 seconds, the display shows "No active n
 
 ## Installation
 
-### 1. Flash the SD card
+### Step 1. Flash the SD card
 
 Flash **Raspberry Pi OS Lite (64-bit)** to the SD card using [Raspberry Pi Imager](https://www.raspberrypi.com/software/).
 
@@ -125,7 +125,7 @@ During the imaging process, configure the following in Raspberry Pi Imager's set
 - Set a username and password
 - Enable SSH
 
-### 2. Boot and update
+### Step 2. Boot and update
 
 Insert the SD card, connect power, and SSH into the device. Then update the system:
 
@@ -133,32 +133,32 @@ Insert the SD card, connect power, and SSH into the device. Then update the syst
 sudo apt update && sudo apt upgrade -y
 ```
 
-### 3. Install git
+### Step 3. Install git
 
 ```bash
 sudo apt install git -y
 ```
 
-### 4. Clone the repository
+### Step 4. Clone the repository
 
 ```bash
-sudo git clone https://github.com/MKWB/RaspberryFluke.git /opt/raspberryfluke
+sudo git clone -b feature/modular-raw-capture https://github.com/MKWB/RaspberryFluke.git /opt/raspberryfluke
 ```
 
-### 5. Run the installer
+### Step 5. Run the installer
 
 ```bash
 cd /opt/raspberryfluke
 sudo bash install.sh
 ```
 
-### 6. Reboot
+### Step 6. Reboot
 
 ```bash
 sudo reboot
 ```
 
-### 7. Verify
+### Step 7. Verify
 
 ```bash
 sudo systemctl status raspberryfluke.service
@@ -170,11 +170,11 @@ The service should show `active (running)`. RaspberryFluke will now start automa
 
 ## What install.sh Does
 
-### Before starting
+#### Before starting
 - Confirms it is being run as root — refuses to proceed if not
 - Confirms RaspberryFluke files exist in `/opt/raspberryfluke` — refuses to proceed if the repo was not cloned first
 
-### Step 1 — System packages
+#### Step 1 — System packages
 Installs the following via `apt-get`:
 - `git` — for cloning repositories
 - `python3` and `python3-pip` — Python runtime
@@ -183,7 +183,7 @@ Installs the following via `apt-get`:
 - `fonts-dejavu-core` — the font used on the display
 - `snmp` — provides `snmpget` and `snmpwalk` for active switch discovery
 
-### Step 2 — Boot time optimizations
+#### Step 2 — Boot time optimizations
 
 Hardware changes written to `/boot/firmware/config.txt`:
 - Disables Bluetooth (not needed, saves 3-5 seconds)
@@ -212,39 +212,39 @@ Network manager replacement:
 Cloud-init lockout:
 - Creates `/etc/cloud/cloud-init.disabled` — prevents cloud-init from running even if service masks are removed
 
-### Step 3 — SPI interface
+#### Step 3 — SPI interface
 - Checks if SPI is already enabled
 - If not, adds `dtparam=spi=on` to `config.txt`
 - SPI is required for the e-paper display to communicate with the Pi
 
-### Step 4 — udev rule
+#### Step 4 — udev rule
 - Creates `/etc/udev/rules.d/99-raspberryfluke-eth0.rules`
 - Fires the instant the kernel detects a cable plugged in
 - Immediately sets eth0 to up and promiscuous mode before any other service reacts
 - Promiscuous mode is required to receive LLDP and CDP multicast frames
 - Reloads udev rules immediately
 
-### Step 5 — Journal persistence
+#### Step 5 — Journal persistence
 - Creates `/var/log/journal/` to enable persistent log storage
 - Configures `Storage=persistent` so logs survive reboots and hard power cuts
 - Sets `SyncIntervalSec=10s` so at most 10 seconds of logs are lost on a hard power cut
 
-### Step 6 — Waveshare e-Paper library
+#### Step 6 — Waveshare e-Paper library
 - Clones the official Waveshare e-Paper repository to `/opt/waveshare-epaper`
 - Copies only the Python driver folder (`waveshare_epd/`) into `/opt/raspberryfluke/`
 - Deletes the full Waveshare clone after copying
 
-### Step 7 — File permissions
+#### Step 7 — File permissions
 - Sets ownership of all files in `/opt/raspberryfluke/` to root
 - Makes `main.py` executable
 
-### Step 8 — Systemd service
+#### Step 8 — Systemd service
 - Copies `raspberryfluke.service` to `/etc/systemd/system/`
 - Reloads systemd
 - Enables the service to start on every boot
 - Starts the service immediately
 
-### At the end
+#### At the end
 - Prints a completion summary
 - Warns that a reboot is required for hardware changes to take effect
 
