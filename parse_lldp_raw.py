@@ -26,7 +26,7 @@ import logging
 import socket
 import struct
 
-from parse_utils import shorten_interface_name, strip_domain, normalize_vlan_value
+from parse_utils import shorten_interface_name, strip_domain, normalize_vlan_value, sanitize_display_string
 
 
 log = logging.getLogger(__name__)
@@ -111,11 +111,16 @@ def _parse_tlvs(lldp_pdu: bytes) -> dict[int, list[bytes]]:
 def _decode_string(value: bytes) -> str:
     """
     Decode a TLV value as a UTF-8 string, falling back to latin-1.
+
+    Non-printable and non-ASCII characters are stripped via
+    parse_utils.sanitize_display_string after decoding.
     """
     try:
-        return value.decode("utf-8").strip()
+        text = value.decode("utf-8").strip()
     except UnicodeDecodeError:
-        return value.decode("latin-1").strip()
+        text = value.decode("latin-1").strip()
+
+    return sanitize_display_string(text)
 
 
 def _extract_chassis_id(tlvs: dict[int, list[bytes]]) -> str:
@@ -166,13 +171,14 @@ def _extract_system_name(tlvs: dict[int, list[bytes]]) -> str:
 
 def _extract_switch_name(tlvs: dict[int, list[bytes]]) -> str:
     """
-    Prefer System Name, fall back to Chassis ID.
+    Extract the switch hostname from the System Name TLV (type 5).
 
-    System Name (type 5) is the most reliable hostname source.
-    Chassis ID (type 1) is used only when System Name is absent.
-    The domain suffix is stripped from both.
+    System Name is the most reliable and human-readable hostname source
+    in LLDP. If it is absent, we return an empty string rather than
+    falling back to Chassis ID — a MAC address on the display is
+    meaningless to a technician and worse than showing "Unknown".
     """
-    name = _extract_system_name(tlvs) or _extract_chassis_id(tlvs)
+    name = _extract_system_name(tlvs)
     return strip_domain(name)
 
 

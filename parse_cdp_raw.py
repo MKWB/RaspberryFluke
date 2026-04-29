@@ -27,7 +27,7 @@ import logging
 import socket
 import struct
 
-from parse_utils import shorten_interface_name, strip_domain, normalize_vlan_value
+from parse_utils import shorten_interface_name, strip_domain, normalize_vlan_value, sanitize_display_string
 
 
 log = logging.getLogger(__name__)
@@ -103,11 +103,16 @@ def _parse_cdp_tlvs(payload: bytes) -> dict[int, list[bytes]]:
 def _decode_string(value: bytes) -> str:
     """
     Decode a TLV value as a UTF-8 string, falling back to latin-1.
+
+    Non-printable and non-ASCII characters are stripped via
+    parse_utils.sanitize_display_string after decoding.
     """
     try:
-        return value.decode("utf-8").strip()
+        text = value.decode("utf-8").strip()
     except UnicodeDecodeError:
-        return value.decode("latin-1").strip()
+        text = value.decode("latin-1").strip()
+
+    return sanitize_display_string(text)
 
 
 def _extract_device_id(tlvs: dict[int, list[bytes]]) -> str:

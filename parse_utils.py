@@ -7,6 +7,7 @@ What this file does:
 - Strip domain suffixes from hostnames
 - Shorten long Cisco-style interface names for the display
 - Normalize VLAN text to a plain numeric string
+- Sanitize strings to printable ASCII before they reach the display
 
 What this file does NOT do:
 - Parse lldpctl keyvalue output (removed with lldpd dependency)
@@ -18,6 +19,27 @@ What this file does NOT do:
 from __future__ import annotations
 
 import re
+
+
+def sanitize_display_string(text: str) -> str:
+    """
+    Strip non-printable and non-ASCII characters from a string.
+
+    Some switches send TLV values with embedded control characters,
+    vendor-specific encoding, or non-ASCII bytes that render as squares
+    or other garbage on the e-paper display. This function keeps only
+    printable ASCII characters (0x20 through 0x7E).
+
+    Both parse_lldp_raw and parse_cdp_raw should pass all string values
+    through this function before returning them to the caller.
+
+    Example:
+        "Gi1/0\\x001" -> "Gi1/0"
+        "switch\\x01.local" -> "switch.local"
+    """
+    if not text:
+        return ""
+    return "".join(c for c in text if 0x20 <= ord(c) <= 0x7E)
 
 
 def strip_domain(hostname: str) -> str:
