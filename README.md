@@ -25,8 +25,10 @@ The goal was to build a practical, open-source alternative to expensive commerci
 - Handles partial results — displays available data even when some fields are missing
 - Compatible with Cisco (CDP/LLDP), FortiSwitch, and any LLDP-capable switch
 - Low-power e-Paper display retains image with zero power draw
-- Optimized boot time — approximately 15-20 seconds from power to discovery
+- Optimized boot time — approximately 20-25 seconds from power to discovery
 - No reboot required between port tests
+- Optional port history logging with three configurable modes
+- Read-only filesystem support for SD card protection against hard power cuts
 - Automatic service startup via systemd
 - Open source
 
@@ -71,7 +73,7 @@ Connect the device to an Ethernet cable plugged into an active switch port. If P
 
 ### Boot
 
-Once powered, the Pi boots Raspberry Pi OS Lite (64-bit). Boot time optimizations applied by the installer reduce startup time to approximately 15-20 seconds. A systemd service launches the RaspberryFluke program automatically as soon as the system is ready.
+Once powered, the Pi boots Raspberry Pi OS Lite (64-bit). Boot time optimizations applied by the installer reduce startup time to approximately 20-25 seconds. A systemd service launches the RaspberryFluke program automatically as soon as the system is ready.
 
 ### Discovery
 
@@ -135,6 +137,8 @@ sudo apt update && sudo apt upgrade -y
 
 ### Step 3. Install git
 
+Git is required to clone the repository. 
+
 ```bash
 sudo apt install git -y
 ```
@@ -142,7 +146,7 @@ sudo apt install git -y
 ### Step 4. Clone the repository
 
 ```bash
-sudo git clone -b feature/modular-raw-capture https://github.com/MKWB/RaspberryFluke.git /opt/raspberryfluke
+sudo git clone https://github.com/MKWB/RaspberryFluke.git /opt/raspberryfluke
 ```
 
 ### Step 5. Run the installer
@@ -166,7 +170,6 @@ sudo systemctl status raspberryfluke.service
 
 The service should show `active (running)`. RaspberryFluke will now start automatically on every boot.
 
----
 
 ## What install.sh Does
 
@@ -238,7 +241,12 @@ Cloud-init lockout:
 - Sets ownership of all files in `/opt/raspberryfluke/` to root
 - Makes `main.py` executable
 
-#### Step 8 — Systemd service
+#### Step 8 — Data directory
+- Creates `/data/raspberryfluke/` for port history storage
+- This directory is used by history logging (modes 1 and 2)
+- On devices with read-only filesystem enabled, this directory is backed by a persistent image file on the boot partition
+
+#### Step 9 — Systemd service
 - Copies `raspberryfluke.service` to `/etc/systemd/system/`
 - Reloads systemd
 - Enables the service to start on every boot
@@ -260,6 +268,9 @@ Optional settings can be adjusted in `/opt/raspberryfluke/rfconfig.py`:
 | `DISCOVERY_TIMEOUT` | `120.0` | Seconds before showing "No active neighbor data" |
 | `RESULT_REVEAL_DELAY` | `1.5` | Minimum seconds "Scanning..." is shown before data replaces it |
 | `PARTIAL_DISPLAY_DELAY` | `30.0` | Seconds to wait before displaying partial results |
+| `PORT_HISTORY_MODE` | `0` | History logging mode: 0=off, 1=port history, 2=debug log |
+| `PORT_HISTORY_LIMIT` | `50` | Maximum number of entries kept in mode 1 |
+| `PORT_HISTORY_PATH` | `"/data/raspberryfluke"` | Directory where history files are written |
 | `LOG_LEVEL` | `"WARNING"` | Set to `"DEBUG"` for verbose logging during troubleshooting |
 
 After changing `rfconfig.py`, restart the service:
@@ -267,6 +278,136 @@ After changing `rfconfig.py`, restart the service:
 ```bash
 sudo systemctl restart raspberryfluke.service
 ```
+
+---
+
+## Port History Logging
+
+RaspberryFluke can optionally record every port discovery result to disk. This is useful for technicians who need a record of which ports were tested during a job.
+
+### Enabling history logging
+
+Edit `/opt/raspberryfluke/rfconfig.py` and set `PORT_HISTORY_MODE`:
+
+```python
+PORT_HISTORY_MODE = 1   # Record last 50 port results
+```
+
+Restart the service:
+
+```bash
+sudo systemctl restart raspberryfluke.service
+```
+
+### Modes
+
+**Mode 0 — Off (default)**
+No history is recorded. No disk writes from application data. Recommended for normal use and fully compatible with the read-only filesystem.
+
+**Mode 1 — Port History**
+Records the last `PORT_HISTORY_LIMIT` port discovery results (default 50) to `/data/raspberryfluke/history.jsonl`. Each entry contains a timestamp, the discovery protocol used, and all switch data. Oldest entries are automatically dropped when the limit is reached.
+
+**Mode 2 — Debug Log**
+Writes verbose rotating log entries to `/data/raspberryfluke/debug.log`. The file rotates at 5MB and three backups are kept. Useful for field troubleshooting without a live SSH session.
+
+### Reading the history log
+
+SSH into the device and run:
+
+```bash
+cat /data/raspberryfluke/history.jsonl
+```
+
+For a formatted, readable view of each entry:
+
+```bash
+cat /data/raspberryfluke/history.jsonl | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if line:
+        print(json.dumps(json.loads(line), indent=2))
+        print()
+"
+```
+
+Example output:
+
+```json
+{
+  "timestamp": "2026-04-30 15:18:09",
+  "protocol": "CDP",
+  "switch_name": "S4-TENFLO-MDF",
+  "switch_ip": "10.126.0.4",
+  "port": "Gi1/0/31",
+  "vlan": "2001",
+  "voice_vlan": "3032"
+}
+```
+
+> **Note:** The Pi Zero 2W has no hardware real-time clock. Timestamps are set by NTP after the device gets a network connection. On networks without internet access, timestamps may not be accurate.
+
+---
+
+## Read-Only Filesystem (Recommended)
+
+RaspberryFluke is designed to be unplugged from PoE at any moment without warning. On a standard read-write filesystem, a hard power cut during a disk write can corrupt the SD card over time. Enabling the read-only filesystem eliminates this risk entirely.
+
+When read-only is enabled:
+- The root filesystem (OS and code) is mounted read-only — the SD card cannot be corrupted by a hard power cut
+- A 256MB writable image file (`/boot/firmware/rfdata.img`) is mounted at `/data` for port history storage
+- All other runtime writes (logs, temp files, DHCP leases) go to RAM and are lost on power cut — this is safe and intentional
+- The device boots and operates identically from the user's perspective
+
+### Enabling read-only
+
+Run this **once** after `install.sh` has completed and the device is confirmed working. Use a stable power source — **not PoE** — while this script runs.
+
+```bash
+sudo bash /opt/raspberryfluke/make_readonly.sh
+```
+
+Type `YES` when prompted. The script will configure the filesystem, create the writable data image, and reboot automatically.
+
+### Verifying read-only is active
+
+After rebooting, confirm the root filesystem is mounted read-only:
+
+```bash
+mount | grep "on / "
+```
+
+The output should include `ro` in the mount options:
+
+/dev/mmcblk0p2 on / type ext4 (ro,noatime)
+
+Also confirm `/data` is writable:
+
+```bash
+mount | grep "/data"
+```
+
+Should show:
+
+/boot/firmware/rfdata.img on /data type ext4 (rw,noatime)
+
+### Updating the device after read-only is enabled
+
+To pull code updates, temporarily remount the root filesystem as writable:
+
+```bash
+sudo remount-rw
+cd /opt/raspberryfluke
+sudo git pull
+sudo remount-ro
+sudo reboot
+```
+
+Always reboot after remounting read-only to ensure a clean state.
+
+### How the writable /data area works
+
+Rather than creating a new partition (which would require shrinking the root partition — a risky operation), RaspberryFluke uses a file-based approach. A 256MB ext4 image file is created at `/boot/firmware/rfdata.img`. The boot partition is always writable even when the root is read-only, so this file persists safely. Linux mounts it as a loop device at `/data` on every boot. The end result is identical to a dedicated partition from the application's perspective.
 
 ---
 
@@ -290,4 +431,30 @@ sudo systemctl restart raspberryfluke.service
 **Check service status:**
 ```bash
 sudo systemctl status raspberryfluke.service
+```
+
+**Check boot time breakdown:**
+```bash
+systemd-analyze blame | head -20
+```
+
+**Confirm read-only filesystem is active:**
+```bash
+mount | grep "on / "
+```
+
+**Read port history:**
+```bash
+cat /data/raspberryfluke/history.jsonl
+```
+
+**Temporarily make root writable for updates:**
+```bash
+sudo remount-rw
+```
+
+**Restore read-only after updates:**
+```bash
+sudo remount-ro
+sudo reboot
 ```
