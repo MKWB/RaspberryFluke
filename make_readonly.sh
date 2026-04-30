@@ -57,6 +57,7 @@ ROOT_PART="${SD_DEVICE}p2"
 DATA_PART="${SD_DEVICE}p3"
 DATA_MOUNT="/data"
 DATA_SIZE_MB=256
+DATA_SIZE_MB_PLUS_ONE=$(( DATA_SIZE_MB + 1 ))
 # -----------------------------------------------------------
 
 # ---- 1. Validation ----------------------------------------
@@ -96,28 +97,18 @@ fi
 if [[ "$DATA_PART_EXISTS" == false ]]; then
     info "Creating ${DATA_SIZE_MB}MB data partition on $SD_DEVICE..."
 
-    # Get the end of the last partition so we know where to start.
-    # parted output: "N  start  end  size  type  fs  flags"
-    LAST_END=$(parted "$SD_DEVICE" --script unit MB print | \
-               awk '/^ [0-9]/{last=$3} END{print last}' | \
-               tr -d 'MB')
-
-    if [[ -z "$LAST_END" ]]; then
-        die "Could not determine end of last partition on $SD_DEVICE."
-    fi
-
-    START_MB="$LAST_END"
-    END_MB=$(( START_MB + DATA_SIZE_MB ))
-
-    info "Creating partition from ${START_MB}MB to ${END_MB}MB..."
-    parted "$SD_DEVICE" --script unit MB mkpart primary ext4 "${START_MB}" "${END_MB}"
+    # Use negative offsets to place the partition at the end of the disk.
+    # This is more reliable than calculating the start position from the
+    # end of the last partition, which can vary based on parted output format.
+    # -257MB to -1MB creates a ~256MB partition at the end of the SD card.
+    parted "$SD_DEVICE" --script unit MB mkpart primary ext4 -- "-${DATA_SIZE_MB_PLUS_ONE}" "-1"
 
     # Wait for the kernel to see the new partition.
     partprobe "$SD_DEVICE" 2>/dev/null || true
     sleep 2
 
     if [[ ! -b "$DATA_PART" ]]; then
-        die "Partition $DATA_PART was not created. Check SD card free space."
+        die "Partition $DATA_PART was not created. Check that the SD card has free space."
     fi
 
     info "Partition $DATA_PART created."
