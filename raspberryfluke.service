@@ -34,6 +34,11 @@ LockPersonality=true
 RestrictSUIDSGID=true
 RemoveIPC=true
 
+# Allow writes to the writable data partition for history logging.
+# /opt/raspberryfluke is read-only on production devices.
+# /data/raspberryfluke is the writable partition for port history and debug logs.
+ReadWritePaths=/data/raspberryfluke
+
 # AF_PACKET  is required for raw socket capture (capture_raw.py, trigger.py).
 # AF_UNIX    is required for general Python runtime communication.
 # AF_NETLINK is required for network interface queries.

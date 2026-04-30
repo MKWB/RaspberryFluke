@@ -344,7 +344,17 @@ chmod 755 "$INSTALL_DIR/main.py"
 
 info "Permissions set."
 
-# ---- 10. Systemd service -----------------------------------
+# ---- 10. Data directory -----------------------------------
+info "Creating writable data directory..."
+
+# Create /data/raspberryfluke even if the writable partition is not yet
+# set up. This allows history logging to work in non-read-only setups
+# (e.g. during testing) and gives make_readonly.sh a target to work with.
+mkdir -p /data/raspberryfluke
+chmod 755 /data/raspberryfluke
+info "Data directory ready at /data/raspberryfluke."
+
+# ---- 11. Systemd service -----------------------------------
 info "Installing systemd service..."
 
 SERVICE_SRC="$INSTALL_DIR/raspberryfluke.service"

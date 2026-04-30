@@ -148,3 +148,32 @@ LCD_BACKLIGHT_BRIGHTNESS = 100
 # ============================================================
 
 LOG_LEVEL = os.environ.get("RF_LOG_LEVEL", "WARNING")
+
+
+# ============================================================
+# ------------------- HISTORY SETTINGS -----------------------
+# ============================================================
+# Controls whether and how port discovery results are saved to disk.
+#
+# PORT_HISTORY_MODE:
+#   0 = Off (default) — nothing written, fully compatible with read-only
+#   1 = Port History  — saves last PORT_HISTORY_LIMIT results to
+#                       PORT_HISTORY_PATH/history.jsonl
+#   2 = Debug Log     — writes verbose rotating log to
+#                       PORT_HISTORY_PATH/debug.log
+#
+# Notes:
+#   - Modes 1 and 2 require the writable /data partition to be mounted.
+#     Run make_readonly.sh to set this up.
+#   - Mode 0 is safe on a read-only filesystem with no writable partition.
+#   - Each history entry is ~180 bytes. 50 entries = ~9KB total.
+#   - The debug log rotates at 5MB and keeps 3 backup files.
+#
+# Read history log via SSH:
+#   cat /data/raspberryfluke/history.jsonl
+#   python3 -m json.tool /data/raspberryfluke/history.jsonl
+# ============================================================
+
+PORT_HISTORY_MODE  = 0
+PORT_HISTORY_LIMIT = 50
+PORT_HISTORY_PATH  = "/data/raspberryfluke"

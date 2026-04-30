@@ -37,6 +37,7 @@ import rfconfig
 import race
 import trigger
 import discover_passive
+import history
 
 # Configure logging before importing display or discovery modules
 # so their loggers inherit the correct level.
@@ -392,6 +393,7 @@ def run() -> None:
                 display.set_startup_mode(False)
                 _show(display, build_display_lines(result), force=True, protocol=protocol)
                 displayed = True
+                history.record(result)
                 log.info(
                     "Display updated | protocol=%s switch=%s ip=%s port=%s vlan=%s voice=%s",
                     protocol,
@@ -484,6 +486,7 @@ def run() -> None:
                     display.set_startup_mode(False)
                     _show(display, build_display_lines(best), force=True, protocol=protocol)
                     displayed = True
+                    history.record(best)
                     log.info(
                         "Partial result displayed after %.0fs delay | "
                         "switch=%s port=%s vlan=%s",
@@ -499,6 +502,7 @@ def run() -> None:
                     display.set_startup_mode(False)
                     _show(display, build_display_lines(best), force=True, protocol=protocol)
                     displayed = True
+                    history.record(best)
                     log.info(
                         "Complete result arrived during partial wait | "
                         "switch=%s port=%s vlan=%s",
