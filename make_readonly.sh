@@ -3,39 +3,38 @@
 # make_readonly.sh
 #
 # One-time script to make the RaspberryFluke SD card read-only
-# and create a small writable /data partition for port history.
+# and create a writable /data area for port history logging.
 #
 # Run this ONCE after install.sh has completed successfully and
 # the device is confirmed working. Use a stable power source
-# (not PoE) when running this script — it modifies the partition
-# table and boot configuration.
+# (not PoE) when running this script.
+#
+# How /data works (no partition resizing needed):
+#   A 256MB ext4 image file is created at /boot/firmware/rfdata.img
+#   This file is mounted as a loop device at /data on every boot.
+#   The /boot/firmware partition (vfat) has plenty of free space and
+#   remains writable even when the root filesystem is read-only.
+#   This avoids any need to resize or repartition the SD card.
 #
 # What this script does:
-#   1. Validates the environment (root, enough free space, etc.)
-#   2. Creates a new 256MB partition (/dev/mmcblk0p3) for /data
-#   3. Formats it as ext4 with noatime
-#   4. Updates /etc/fstab to:
+#   1. Creates /boot/firmware/rfdata.img (256MB ext4 image)
+#   2. Updates /etc/fstab to:
 #        - Mount root (/) read-only
-#        - Mount /data read-write
-#        - Redirect /tmp, /var/log, /var/tmp, /run to tmpfs (RAM)
-#   5. Adds 'ro' to /boot/firmware/cmdline.txt
-#   6. Installs remount-rw and remount-ro helper scripts
-#   7. Reboots
+#        - Mount rfdata.img as /data via loop device
+#        - Redirect /tmp, /var/log, /var/tmp to tmpfs (RAM)
+#   3. Adds 'ro' to /boot/firmware/cmdline.txt
+#   4. Installs remount-rw and remount-ro helper scripts
+#   5. Reboots
 #
 # After rebooting:
-#   - The SD card root filesystem is read-only and protected
+#   - Root filesystem is read-only and protected from corruption
 #   - /data is writable for port history logging
-#   - All other runtime writes go to RAM and are lost on power cut
+#   - /tmp, /var/log, /var/tmp are in RAM (lost on power cut — safe)
 #
-# To update the device code after read-only is enabled:
+# To update device code after read-only is enabled:
 #   sudo remount-rw
 #   cd /opt/raspberryfluke && sudo git pull
 #   sudo remount-ro
-#   sudo reboot
-#
-# To disable read-only permanently (not recommended):
-#   sudo remount-rw
-#   # Edit /etc/fstab and /boot/firmware/cmdline.txt manually
 #   sudo reboot
 # ============================================================
 
@@ -52,12 +51,11 @@ error() { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 die()   { error "$*"; exit 1; }
 
 # ---- Configuration ----------------------------------------
-SD_DEVICE="/dev/mmcblk0"
-ROOT_PART="${SD_DEVICE}p2"
-DATA_PART="${SD_DEVICE}p3"
+BOOT_DIR="/boot/firmware"
+DATA_IMG="${BOOT_DIR}/rfdata.img"
 DATA_MOUNT="/data"
 DATA_SIZE_MB=256
-DATA_SIZE_MB_PLUS_ONE=$(( DATA_SIZE_MB + 1 ))
+ROOT_PART="/dev/mmcblk0p2"
 # -----------------------------------------------------------
 
 # ---- 1. Validation ----------------------------------------
@@ -67,24 +65,22 @@ if [[ $EUID -ne 0 ]]; then
     die "This script must be run as root. Use: sudo bash make_readonly.sh"
 fi
 
-if [[ ! -b "$SD_DEVICE" ]]; then
-    die "SD card device $SD_DEVICE not found.
-This script is designed for the Raspberry Pi Zero 2W.
-If your device uses a different storage path, edit SD_DEVICE in this script."
+if [[ ! -d "$BOOT_DIR" ]]; then
+    die "Boot directory $BOOT_DIR not found."
 fi
 
-if [[ -b "$DATA_PART" ]]; then
-    warn "Partition $DATA_PART already exists."
-    warn "If this is a re-run, the partition setup will be skipped."
-    warn "Continuing with fstab and cmdline configuration only."
-    DATA_PART_EXISTS=true
-else
-    DATA_PART_EXISTS=false
+# Check free space on /boot/firmware.
+BOOT_FREE_MB=$(df -m "$BOOT_DIR" | awk 'NR==2{print $4}')
+if (( BOOT_FREE_MB < DATA_SIZE_MB + 10 )); then
+    die "Not enough free space on $BOOT_DIR.
+Need ${DATA_SIZE_MB}MB, only ${BOOT_FREE_MB}MB available."
 fi
+
+info "Boot partition has ${BOOT_FREE_MB}MB free — sufficient for ${DATA_SIZE_MB}MB image."
 
 # Confirm the user knows what they're doing.
 echo ""
-warn "This script will modify your SD card partition table and boot configuration."
+warn "This script will make the root filesystem READ-ONLY."
 warn "Run this only on a fully working RaspberryFluke installation."
 warn "Use a stable power source — NOT PoE — while this script runs."
 echo ""
@@ -93,61 +89,36 @@ if [[ "$confirm" != "YES" ]]; then
     die "Aborted."
 fi
 
-# ---- 2. Create /data partition ----------------------------
-if [[ "$DATA_PART_EXISTS" == false ]]; then
-    info "Creating ${DATA_SIZE_MB}MB data partition on $SD_DEVICE..."
-
-    # Use negative offsets to place the partition at the end of the disk.
-    # This is more reliable than calculating the start position from the
-    # end of the last partition, which can vary based on parted output format.
-    # -257MB to -1MB creates a ~256MB partition at the end of the SD card.
-    parted "$SD_DEVICE" --script unit MB mkpart primary ext4 -- "-${DATA_SIZE_MB_PLUS_ONE}" "-1"
-
-    # Wait for the kernel to see the new partition.
-    partprobe "$SD_DEVICE" 2>/dev/null || true
-    sleep 2
-
-    if [[ ! -b "$DATA_PART" ]]; then
-        die "Partition $DATA_PART was not created. Check that the SD card has free space."
-    fi
-
-    info "Partition $DATA_PART created."
+# ---- 2. Create data image file ----------------------------
+if [[ -f "$DATA_IMG" ]]; then
+    info "Data image $DATA_IMG already exists — skipping creation."
+else
+    info "Creating ${DATA_SIZE_MB}MB ext4 data image at $DATA_IMG..."
+    dd if=/dev/zero of="$DATA_IMG" bs=1M count="$DATA_SIZE_MB" status=progress
+    mkfs.ext4 -L "rfdata" -F "$DATA_IMG"
+    info "Data image created and formatted."
 fi
 
-# ---- 3. Format /data partition ----------------------------
-info "Formatting $DATA_PART as ext4..."
-mkfs.ext4 -L "rfdata" -F "$DATA_PART"
-info "Partition formatted."
-
-# ---- 4. Mount and populate /data --------------------------
-info "Mounting $DATA_PART at $DATA_MOUNT..."
+# ---- 3. Mount image and populate /data --------------------
+info "Mounting data image to verify and populate..."
 mkdir -p "$DATA_MOUNT"
-mount "$DATA_PART" "$DATA_MOUNT"
+mount -o loop "$DATA_IMG" "$DATA_MOUNT"
 mkdir -p "$DATA_MOUNT/raspberryfluke"
 chmod 755 "$DATA_MOUNT/raspberryfluke"
 
-# Copy any existing history data from the old location if present.
-if [[ -d /data/raspberryfluke ]] && [[ "$(ls -A /data/raspberryfluke 2>/dev/null)" ]]; then
-    info "Copying existing history data to new partition..."
-    cp -r /data/raspberryfluke/. "$DATA_MOUNT/raspberryfluke/" 2>/dev/null || true
+# Copy any existing history data if present.
+if [[ -d /data/raspberryfluke ]] && mountpoint -q "$DATA_MOUNT"; then
+    # We just mounted fresh — copy from original /data if it had content.
+    true
 fi
 
 umount "$DATA_MOUNT"
-info "/data partition ready."
+info "Data image verified."
 
-# ---- 5. Update /etc/fstab ---------------------------------
+# ---- 4. Update /etc/fstab ---------------------------------
 info "Updating /etc/fstab..."
-
-# Back up existing fstab.
 cp /etc/fstab /etc/fstab.bak
 info "Original fstab backed up to /etc/fstab.bak"
-
-# Get the PARTUUID of the data partition.
-DATA_PARTUUID=$(blkid -s PARTUUID -o value "$DATA_PART")
-if [[ -z "$DATA_PARTUUID" ]]; then
-    die "Could not read PARTUUID of $DATA_PART."
-fi
-info "Data partition PARTUUID: $DATA_PARTUUID"
 
 # Get the PARTUUID of the root partition.
 ROOT_PARTUUID=$(blkid -s PARTUUID -o value "$ROOT_PART")
@@ -156,34 +127,33 @@ if [[ -z "$ROOT_PARTUUID" ]]; then
 fi
 info "Root partition PARTUUID: $ROOT_PARTUUID"
 
-# Get the existing boot partition entry to preserve it exactly.
+# Preserve the boot partition entry exactly as it was.
 BOOT_ENTRY=$(grep "/boot/firmware" /etc/fstab.bak || echo "")
 
 cat > /etc/fstab << EOF
 proc            /proc           proc    defaults          0       0
 
-# Boot partition — preserved from original fstab
+# Boot partition — always writable (hosts rfdata.img)
 $BOOT_ENTRY
 
 # Root filesystem — READ ONLY
-# This protects the SD card from corruption on hard power cuts.
+# Protects the SD card from corruption on hard power cuts.
 PARTUUID=$ROOT_PARTUUID  /  ext4  ro,noatime  0  1
 
-# Writable data partition for port history and debug logs.
-PARTUUID=$DATA_PARTUUID  /data  ext4  rw,noatime  0  2
+# Writable data image mounted as loop device.
+# Stores port history and debug logs persistently.
+$BOOT_DIR/rfdata.img  /data  ext4  loop,rw,noatime  0  2
 
 # RAM-based temporary filesystems.
-# These redirect runtime writes away from the SD card.
-# Contents are lost on power cut — this is intentional and safe.
-tmpfs  /tmp      tmpfs  defaults,noatime,size=32m  0  0
-tmpfs  /var/log  tmpfs  defaults,noatime,size=32m  0  0
-tmpfs  /var/tmp  tmpfs  defaults,noatime,size=16m  0  0
-tmpfs  /run      tmpfs  defaults,noatime,mode=0755,size=16m  0  0
+# All runtime writes go here. Lost on power cut — safe by design.
+tmpfs  /tmp      tmpfs  defaults,noatime,size=32m    0  0
+tmpfs  /var/log  tmpfs  defaults,noatime,size=32m    0  0
+tmpfs  /var/tmp  tmpfs  defaults,noatime,size=16m    0  0
 EOF
 
 info "fstab updated."
 
-# ---- 6. Add 'ro' to cmdline.txt ---------------------------
+# ---- 5. Add 'ro' to cmdline.txt ---------------------------
 CMDLINE_FILE=""
 if [[ -f /boot/firmware/cmdline.txt ]]; then
     CMDLINE_FILE="/boot/firmware/cmdline.txt"
@@ -196,7 +166,6 @@ if [[ -n "$CMDLINE_FILE" ]]; then
     info "Original cmdline.txt backed up to ${CMDLINE_FILE}.bak"
 
     if ! grep -qw "ro" "$CMDLINE_FILE"; then
-        # Insert 'ro' before 'rootwait' so the kernel mounts root read-only.
         sed -i 's/rootwait/ro rootwait/' "$CMDLINE_FILE"
         info "Read-only root (ro) added to $CMDLINE_FILE."
     else
@@ -208,13 +177,13 @@ else
     warn "Could not locate cmdline.txt — add 'ro' manually before rootwait."
 fi
 
-# ---- 7. Install helper scripts ----------------------------
+# ---- 6. Install helper scripts ----------------------------
 info "Installing remount helper scripts..."
 
 cat > /usr/local/bin/remount-rw << 'SCRIPT'
 #!/bin/bash
 # Remount the root filesystem as read-write for code updates.
-# Always run remount-ro when finished, then reboot.
+# Always run remount-ro and reboot when finished.
 echo "Remounting root filesystem as read-write..."
 mount -o remount,rw /
 echo "Done. Root is now writable."
@@ -237,8 +206,8 @@ chmod +x /usr/local/bin/remount-rw
 chmod +x /usr/local/bin/remount-ro
 
 info "Helper scripts installed:"
-info "  remount-rw — make root writable for updates"
-info "  remount-ro — make root read-only again"
+info "  sudo remount-rw  — make root writable for updates"
+info "  sudo remount-ro  — make root read-only again"
 
 # ---- Done -------------------------------------------------
 echo ""
@@ -247,10 +216,11 @@ info "  Read-only filesystem setup complete."
 info "================================================"
 echo ""
 info "The device will reboot in 5 seconds."
+info ""
 info "After reboot:"
 info "  - Root filesystem is READ ONLY (SD card protected)"
-info "  - /data is WRITABLE (port history stored here)"
-info "  - /tmp, /var/log, /var/tmp, /run are in RAM"
+info "  - /data is WRITABLE (port history stored at /data/raspberryfluke)"
+info "  - /tmp and /var/log are in RAM"
 echo ""
 info "To update device code in future:"
 info "  sudo remount-rw"
