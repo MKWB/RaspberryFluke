@@ -74,6 +74,7 @@ apt-get install -y \
     python3-pil \
     python3-lgpio \
     python3-rpi.gpio \
+    python3-spidev \
     fonts-dejavu-core \
     snmp
 
