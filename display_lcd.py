@@ -172,7 +172,18 @@ class LCDDisplay:
             self._show_image(image)
             self.last_lines = ["", "", "", "", ""]
 
-    def show_lines(self, lines, force=False):
+    def set_startup_mode(self, enabled):
+        """
+        No-op for LCD displays.
+
+        EPaperDisplay uses this to control partial vs full refresh behavior
+        during startup. LCDs overwrite the screen directly on every update
+        so no equivalent mode is needed. This method exists so main.py can
+        call it without needing to know which display type is in use.
+        """
+        pass
+
+    def show_lines(self, lines, force=False, protocol=""):
         """
         Show text on the LCD display.
 
